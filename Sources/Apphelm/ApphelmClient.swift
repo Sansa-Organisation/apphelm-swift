@@ -53,8 +53,14 @@ public struct ApphelmOptions: Sendable {
   /// Set them after `init`: `options.surveyKey = "ahl_pub_…"`.
   public var surveyKey: String? = nil
   public var surveyOrigin: String? = nil
+  /// What the person agreed to for ads (nil: nothing, the default). Set it from your consent
+  /// prompt; Apphelm does not ask. While set, every event carries `$ad_consent` and
+  /// `recordInstall` sends the install's ad evidence for Yieldline. Change it later with
+  /// `ApphelmClient.setAdsConsent`.
+  public var adsConsent: AdsConsent? = nil
 
-  public init(apiKey: String, baseURL: String = "https://apphelm.dev", workspaceId: String, productId: String, distinctId: String? = nil, timeoutSeconds: Double = 10, release: String? = nil, environment: String? = nil, tracesSampleRate: Double = 1, tracePropagationHosts: [String] = []) {
+  public init(apiKey: String, baseURL: String = "https://apphelm.dev", workspaceId: String, productId: String, distinctId: String? = nil, timeoutSeconds: Double = 10, release: String? = nil, environment: String? = nil, tracesSampleRate: Double = 1, tracePropagationHosts: [String] = [], adsConsent: AdsConsent? = nil) {
+    self.adsConsent = adsConsent
     self.tracePropagationHosts = tracePropagationHosts
     self.apiKey = apiKey
     self.baseURL = baseURL
@@ -97,6 +103,8 @@ public final class ApphelmClient: Sendable {
   private let options: ApphelmOptions
   private let session: URLSession
   private let store: any DistinctIdStore
+  private let installStore: any InstallRecordStore
+  private let attributionToken: AttributionTokenProvider
   private let lock = NSLock()
   private var _distinctId: String
   private var queue: [[String: Any]] = []
@@ -104,10 +112,22 @@ public final class ApphelmClient: Sendable {
   private var health: (hash: String, clock: TraceClock, directory: URL)?
   // The most recently started transaction, held weakly: an abandoned one is not kept alive.
   private weak var active: Transaction?
+  private var _adsConsent: AdsConsent?
+  // Set once this client has queued (or found) the install, so it is queued at most once
+  // even when the install record cannot be saved.
+  private var installClaimed = false
 
-  public init(options: ApphelmOptions, session: URLSession = .shared, store: (any DistinctIdStore)? = nil) {
+  /// `installStore` remembers that `$install` was sent (`UserDefaultsInstallRecordStore` by default).
+  public convenience init(options: ApphelmOptions, session: URLSession = .shared, store: (any DistinctIdStore)? = nil, installStore: (any InstallRecordStore)? = nil) {
+    self.init(options: options, session: session, store: store, installStore: installStore, attributionToken: appleAdsAttributionToken)
+  }
+
+  init(options: ApphelmOptions, session: URLSession, store: (any DistinctIdStore)?, installStore: (any InstallRecordStore)?, attributionToken: @escaping AttributionTokenProvider) {
     self.options = options
     self.session = session
+    self.installStore = installStore ?? UserDefaultsInstallRecordStore()
+    self.attributionToken = attributionToken
+    self._adsConsent = options.adsConsent
     let resolvedStore: any DistinctIdStore = store ?? UserDefaultsStore()
     self.store = resolvedStore
     if let explicit = options.distinctId?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
@@ -163,10 +183,67 @@ public final class ApphelmClient: Sendable {
 
   private func enqueue(_ trimmed: String, properties: [String: Any]) {
     lock.withLock {
+      var properties = properties
+      // The consent the event was tracked under, not the one in force when it is flushed.
+      if let consent = _adsConsent, !customerSignalEvents.contains(trimmed) { properties["$ad_consent"] = consent.rawValue }
       // The id and time are fixed at track time, so a resend after a lost response is stored once.
       queue.append(["eventName": trimmed, "properties": properties, "eventId": UUID().uuidString, "occurredAt": ISO8601DateFormatter().string(from: Date())])
       while queue.count > 100 { queue.removeFirst() }
     }
+  }
+
+  /// What the person agreed to for ads, or nil: `ApphelmOptions.adsConsent` until changed.
+  public var adsConsent: AdsConsent? {
+    lock.withLock { _adsConsent }
+  }
+
+  /// Change the ads consent, after your consent prompt or when the person changes their mind.
+  /// Events tracked from now on carry it as `$ad_consent`; with nil they carry nothing
+  /// ad-related. Events already queued keep the consent they were tracked under.
+  public func setAdsConsent(_ consent: AdsConsent?) {
+    lock.withLock { _adsConsent = consent }
+  }
+
+  /// `properties` with `$ad_consent` while ads consent is set.
+  private func withAdConsent(_ properties: [String: Any]) -> [String: Any] {
+    guard let consent = adsConsent else { return properties }
+    var merged = properties
+    merged["$ad_consent"] = consent.rawValue
+    return merged
+  }
+
+  /// Queue `$install`, once per install: call it on every launch, early. It is sent with the
+  /// next `flush()`. It carries the platform and `appVersion` (by default the bundle's
+  /// `CFBundleShortVersionString`), and is useful analytics on its own.
+  ///
+  /// With ads consent it also carries `$ad`: the platform and the Apple Ads attribution token
+  /// (AdServices), which Yieldline exchanges with Apple to attribute the install to a Search
+  /// Ads campaign. The token needs no App Tracking Transparency prompt, and no advertising
+  /// identifier is read. When the system gives no token, `$ad` is sent without one.
+  ///
+  /// The install is remembered in `installStore`; when that cannot be saved it is still
+  /// queued at most once per client. Returns whether it was queued by this call.
+  @discardableResult
+  public func recordInstall(appVersion: String? = nil) async -> Bool {
+    let claimed: Bool = lock.withLock {
+      if installClaimed { return false }
+      installClaimed = true
+      return true
+    }
+    guard claimed, !installStore.isInstallRecorded() else { return false }
+    var properties: [String: Any] = ["platform": adPlatform]
+    let version = (appVersion ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !version.isEmpty { properties["app_version"] = String(version.prefix(120)) }
+    if adsConsent != nil {
+      var evidence: [String: String] = ["platform": adPlatform]
+      let token = ((try? await attributionToken()) ?? nil)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if !token.isEmpty, token.count <= maxAppleAdsTokenLength { evidence["apple_ads_token"] = token }
+      // Consent may have been withdrawn while the token was fetched.
+      if adsConsent != nil { properties["$ad"] = evidence }
+    }
+    enqueue("$install", properties: properties)
+    installStore.markInstallRecorded()
+    return true
   }
 
   /// Screen view. Sent as `page_viewed` with the screen name as path.
@@ -550,7 +627,7 @@ public final class ApphelmClient: Sendable {
       "productId": options.productId,
       "eventName": "$transaction",
       "privacyMode": "strict",
-      "properties": properties,
+      "properties": withAdConsent(properties),
     ])
     _ = envelope
   }
@@ -577,7 +654,7 @@ public final class ApphelmClient: Sendable {
       "productId": options.productId,
       "eventName": "$exception",
       "privacyMode": "strict",
-      "properties": merged,
+      "properties": withAdConsent(merged),
     ])
     _ = envelope
   }

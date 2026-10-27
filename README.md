@@ -6,6 +6,7 @@ Swift Package Manager library. URLSession only — no UIKit, no WebKit, no JavaS
 - Crash capture: `installCrashReporting()` and `sendPendingCrashReports()` (uncaught `NSException`s and fatal signals, sent on the next launch).
 - Tracing: `startTransaction`, spans, W3C `traceparent`, and screen and `URLSession` spans without wrapping each call (below).
 - Release health: `startSession` and `endSession` (below).
+- Ad measurement: `adsConsent`, `setAdsConsent` and `recordInstall` (below). Off unless you set `adsConsent`.
 - `evaluateLocalFlag` + `assignmentBucket`: pure local evaluation in the same assignment family as the server and every other SDK.
 - Distinct ids persist through an injectable store (`UserDefaultsStore` by default).
 
@@ -184,6 +185,43 @@ the workspace's collection switch still apply. The server refuses a request with
 Verified with `swift test` on macOS against a stubbed server, and `tests/mobile-surveys.test.ts`
 puts the same request bodies through the server's schemas. Not run on a device, and not run
 against a deployed Apphelm.
+
+## Ad measurement
+
+Installs and conversions reach the ad platforms through Apphelm, with no Firebase, Meta SDK
+or MMP in the app: Apphelm forwards them to Yieldline, which reports them to Apple, Google,
+Meta and the others. It is off unless you set `adsConsent`. Asking the person is your app's
+job; Apphelm takes the answer you pass and switches the rest on from it.
+
+```swift
+var options = ApphelmOptions(/* … */, adsConsent: userAgreedToAds ? .measurement : nil)
+// .personalization when they also agreed to ads personalised from it
+let apphelm = ApphelmClient(options: options)
+
+// Early on every launch: queued the first time only, sent with the next flush.
+await apphelm.recordInstall()
+await apphelm.flush()
+
+// When the person answers (or changes their answer) later:
+apphelm.setAdsConsent(.measurement) // or nil to stop
+```
+
+- While `adsConsent` is set, every event carries `$ad_consent` (`measurement` or
+  `personalization`), so Yieldline knows what each conversion may be used for. With nil,
+  events carry nothing ad-related. Events already queued keep the consent they were tracked
+  under. Identify, group, goal and outcome signals never carry it.
+- `recordInstall(appVersion:)` queues `$install` once per install, remembered in
+  `installStore` (`UserDefaultsInstallRecordStore`, key `apphelm.installRecorded`, by
+  default). It carries `platform` (`ios` or `macos`) and `app_version` (by default the
+  bundle's `CFBundleShortVersionString`), and is sent with or without consent: without it,
+  it is an ordinary analytics event.
+- With consent, `$install` also carries `$ad`: the platform and the Apple Ads attribution
+  token from AdServices (`AAAttribution.attributionToken()`), which Yieldline exchanges with
+  Apple to attribute the install to a Search Ads campaign. When the system gives no token
+  (a simulator, an older OS, an error) `$ad` is sent without it.
+- No App Tracking Transparency prompt, and no advertising identifier (IDFA) is read: the
+  attribution token does not need either. AdServices is a system framework; the package
+  still has no dependencies.
 
 ## Symbolicating stripped builds
 
