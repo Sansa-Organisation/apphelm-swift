@@ -81,7 +81,7 @@ private func isHex(_ value: String?, _ count: Int) -> Bool {
 @Suite("Tracing")
 struct TracingTests {
   func options(_ recorder: Recorder, rate: Double = 1) -> ApphelmOptions {
-    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: "shop@2.4.1", environment: "production", tracesSampleRate: rate)
+    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: "shop@2.4.1", environment: "production", tracesSampleRate: rate).quiet
   }
 
   @Test("A transaction sends the $transaction shape the other clients send, once")

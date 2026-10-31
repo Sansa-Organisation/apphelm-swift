@@ -8,7 +8,7 @@ private struct NoToken: Error {}
 @Suite("Ad measurement")
 struct AdMeasurementTests {
   func options(_ recorder: Recorder, consent: AdsConsent? = nil) -> ApphelmOptions {
-    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: "shop@2.4.1", adsConsent: consent)
+    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: "shop@2.4.1", adsConsent: consent).quiet
   }
 
   func client(_ recorder: Recorder, consent: AdsConsent? = nil, installStore: any InstallRecordStore = MemoryInstallRecordStore(), token: @escaping AttributionTokenProvider = { "apple-token-1" }) -> ApphelmClient {

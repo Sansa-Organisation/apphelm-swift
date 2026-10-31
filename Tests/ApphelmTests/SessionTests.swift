@@ -20,7 +20,7 @@ private func storeCrashReport(in folder: URL, written: Date) throws {
 @Suite("Release-health sessions")
 struct SessionTests {
   func options(_ recorder: Recorder, release: String? = "ios@2.3.0", environment: String? = "production") -> ApphelmOptions {
-    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: release, environment: environment)
+    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: release, environment: environment).quiet
   }
 
   func sessions(_ recorder: Recorder) -> [[String: Any]] {

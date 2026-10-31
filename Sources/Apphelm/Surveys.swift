@@ -1,14 +1,17 @@
 import Foundation
 
-/// An answer to a survey question: text (an option, a category, free text) or a number.
+/// An answer to a survey question: text (an option, a category, free text), a number, or
+/// the options picked in a multiple choice question.
 public enum SurveyValue: Sendable, Equatable {
   case text(String)
   case number(Double)
+  case list([String])
 
   var json: Any {
     switch self {
     case .text(let value): return value
     case .number(let value): return value
+    case .list(let value): return value
     }
   }
 }
@@ -47,8 +50,12 @@ public struct SurveyQuestion: Sendable, Equatable {
     case open
     /// One of `options`.
     case choice
+    /// Any of `options`, answered with `SurveyValue.list`.
+    case multipleChoice = "multiple_choice"
     /// A whole number in `scale`.
     case rating
+    /// A button that opens `link`; answered with "clicked".
+    case link
   }
 
   public let key: String
@@ -58,6 +65,14 @@ public struct SurveyQuestion: Sendable, Equatable {
   public let scale: ClosedRange<Int>
   /// Where an answer leads: a later question's key, or `end`. See `SurveyOffer.route`.
   public let branch: SurveyBranch
+  /// A rating's look: `number` (the default) or `emoji` (faces, on a 1-3 or 1-5 scale).
+  public var display: String? = nil
+  /// Words under a rating's lowest and highest values.
+  public var lowerLabel: String? = nil
+  public var upperLabel: String? = nil
+  /// A link question's https link and its button text.
+  public var link: String? = nil
+  public var buttonText: String? = nil
 }
 
 /// A survey the server offers this person now, from `ApphelmClient.surveyEligible`. The app
@@ -87,6 +102,16 @@ public struct SurveyOffer: Sendable, Equatable {
   /// The workspace's privacy notice for this survey, an https link, to show beside it as
   /// "How we use this"; nil when the workspace has none.
   public var privacyNoticeUrl: String? = nil
+  /// A custom survey's first question: `choice` (nil means choice), `open` or `link`.
+  public var primaryType: String? = nil
+  /// A custom link question's https link and button text.
+  public var link: String? = nil
+  public var buttonText: String? = nil
+  /// How the survey is drawn (colours, texts, position); nil when the program sets none.
+  public var appearance: SurveyAppearance? = nil
+  /// `host` or `auto`, and the seconds an automatic survey waits; nil when the program sets none.
+  public var displayMode: String? = nil
+  public var delaySeconds: Int = 0
 
   /// The additional questions this person is asked, in order, given the primary answer (the
   /// category or the score) and the answers so far: an answer's branch jumps forward to a
@@ -170,6 +195,7 @@ func branchTarget(_ branch: SurveyBranch, answer: SurveyValue?) -> String? {
   switch answer {
   case nil: return nil
   case .text(let value): return branch[value]
+  case .list: return nil
   case .number(let value):
     let indexed = branch.rules.filter { isIndexKey($0.rule) }.sorted { UInt32($0.rule)! < UInt32($1.rule)! }
     let written = branch.rules.filter { !isIndexKey($0.rule) }
@@ -264,13 +290,19 @@ func surveyOffer(_ data: OrderedJSONObject) -> SurveyOffer? {
     let low = whole(scale?["min"]) ?? 1
     return SurveyQuestion(
       key: key, text: item["text"] as? String ?? "", type: SurveyQuestion.Kind(rawValue: item["type"] as? String ?? "") ?? .open,
-      options: item["options"] as? [String] ?? [], scale: low...max(low, whole(scale?["max"]) ?? 5), branch: branch(item))
+      options: item["options"] as? [String] ?? [], scale: low...max(low, whole(scale?["max"]) ?? 5), branch: branch(item),
+      display: item["display"] as? String, lowerLabel: item["lowerLabel"] as? String, upperLabel: item["upperLabel"] as? String,
+      link: item["link"] as? String, buttonText: item["buttonText"] as? String)
   }
+  let display = program["display"] as? OrderedJSONObject
   return SurveyOffer(
     exposureId: exposureId, anonymous: data["anonymous"] as? Bool == true, programId: program["id"] as? String ?? "", name: program["name"] as? String ?? "",
     templateType: program["templateType"] as? String ?? "", version: whole(program["version"]) ?? 0, question: question["primary"] as? String ?? "",
     openTextPrompt: question["openText"] as? String, options: question["customOptions"] as? [String] ?? [],
     followUpQuestion: (program["followUp"] as? OrderedJSONObject)?["question"] as? String, additional: additional, branch: branch(question),
     expiresAt: Date(timeIntervalSince1970: (data["expiresAt"] as? NSNumber)?.doubleValue ?? 0),
-    privacyNoticeUrl: ((data["privacyNotice"] as? OrderedJSONObject)?["url"] as? String).flatMap { $0.hasPrefix("https://") ? $0 : nil })
+    privacyNoticeUrl: ((data["privacyNotice"] as? OrderedJSONObject)?["url"] as? String).flatMap { $0.hasPrefix("https://") ? $0 : nil },
+    primaryType: question["primaryType"] as? String, link: question["link"] as? String, buttonText: question["buttonText"] as? String,
+    appearance: (program["appearance"] as? OrderedJSONObject).map(surveyAppearance),
+    displayMode: display?["mode"] as? String, delaySeconds: whole(display?["delaySeconds"]) ?? 0)
 }

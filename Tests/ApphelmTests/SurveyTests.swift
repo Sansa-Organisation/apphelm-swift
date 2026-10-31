@@ -24,7 +24,7 @@ private final class SurveyServer: @unchecked Sendable {
   var last: Seen { requests[requests.count - 1] }
 
   func options(key: String? = "ahl_pub_test", origin: String? = "https://app.shop.example") -> ApphelmOptions {
-    var options = ApphelmOptions(apiKey: "ahl_live_test", baseURL: "https://\(host)/", workspaceId: "org_1", productId: "prd_1", distinctId: "user-1")
+    var options = ApphelmOptions(apiKey: "ahl_live_test", baseURL: "https://\(host)/", workspaceId: "org_1", productId: "prd_1", distinctId: "user-1").quiet
     options.surveyKey = key
     options.surveyOrigin = origin
     return options

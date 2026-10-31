@@ -20,7 +20,7 @@ func clearCrashFolder() {
 // In the serialized transport suite: the stub URL protocol's handler is shared state.
 extension ClientTests {
   func releaseOptions() -> ApphelmOptions {
-    ApphelmOptions(apiKey: "ahl_live_test", workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: "ios@2.3.0", environment: "production")
+    ApphelmOptions(apiKey: "ahl_live_test", workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", release: "ios@2.3.0", environment: "production").quiet
   }
 
   @Test("captureException sends release, environment, tags, handled and the call-site stack")

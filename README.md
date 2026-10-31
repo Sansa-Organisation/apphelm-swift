@@ -1,8 +1,10 @@
 # Apphelm native iOS/macOS SDK
 
-Swift Package Manager library. URLSession only — no UIKit, no WebKit, no JavaScript.
+Swift Package Manager library on URLSession, with no dependencies. UIKit is used only where it
+exists, for lifecycle events, screen autocapture and background flushing; no WebKit, no JavaScript.
 
-- `ApphelmClient`: `track`, `screen` (`page_viewed`), `identify`, `evaluateFlags`, fail-closed `isEnabled`, `captureException`, bounded in-memory queue with `flush`.
+- `ApphelmClient`: `track`, `screen` (`$screen`), `identify`, `alias`, `group`, `register`, `reset`, `optOut`, `evaluateFlags`, fail-closed `isEnabled`, `captureException`. Events wait in a queue on disk and are sent on their own (below); `flush()` sends them now.
+- Lifecycle events (`$app_installed`, `$app_updated`, `$app_opened`, `$app_backgrounded`) and UIKit screen views, captured automatically; `.apphelmScreen("Name")` for SwiftUI.
 - Crash capture: `installCrashReporting()` and `sendPendingCrashReports()` (uncaught `NSException`s and fatal signals, sent on the next launch).
 - Tracing: `startTransaction`, spans, W3C `traceparent`, and screen and `URLSession` spans without wrapping each call (below).
 - Release health: `startSession` and `endSession` (below).
@@ -17,10 +19,102 @@ swift test
 Install with Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/Sansa-Organisation/apphelm-swift.git", from: "0.4.0")
+.package(url: "https://github.com/Sansa-Organisation/apphelm-swift.git", from: "0.6.0")
 // target dependency: .product(name: "Apphelm", package: "apphelm-swift")
 ```
 
+
+## Analytics: queue, lifecycle, screens, identity and opt-out
+
+```swift
+let apphelm = ApphelmClient(options: ApphelmOptions(apiKey: "ahl_live_…", workspaceId: "org_…", productId: "prd_…"))
+
+apphelm.track("checkout_completed", properties: ["total": 42])
+apphelm.screen("Checkout")                         // UIKit screens are also captured on their own
+apphelm.identify(user.id, traits: ["plan": "pro"]) // at log-in
+apphelm.group(type: "company", key: org.id, traits: ["name": org.name])
+apphelm.register(["theme": "dark"])                // on every later event
+apphelm.reset()                                    // at log-out
+apphelm.optOut()                                   // analytics off until optIn(), remembered
+
+// SwiftUI
+CheckoutView().apphelmScreen("Checkout")
+```
+
+**Sending.** Events wait in a queue and are sent without a call to `flush()`:
+
+- every `flushIntervalSeconds` (default 30; 0 turns the timer off), as soon as `flushAt`
+  events are queued (default 20; 0 turns it off), and when the app goes to the background
+  (`flushOnBackground`, default true), with a background task so the send can finish;
+- `await flush()` still sends everything now. Flushes run one at a time.
+
+The queue is on disk (`persistence: .disk`, the default): one small file per event in
+`Application Support/Apphelm/queue-<hash>`, one folder per product, written atomically and
+left out of backups. Events survive the app being killed and are sent on a later launch. It
+holds `maxQueueSize` events (default 1000), the oldest dropped first. A send that fails
+(offline, a 5xx) leaves that event and the ones after it queued, in order, with the same
+event id and time, so nothing is lost or sent twice. An event the server refuses for good
+(400, 413, 422) is dropped rather than holding up the queue. `.directory(url, suiteName:)`
+puts the queue and the state somewhere else (an app group); `.memory` writes nothing.
+
+Each event's `distinct_id`, super properties and groups are fixed when it is tracked, not
+when it is sent. A property JSON can't hold is sent as text (a `Date` as ISO 8601).
+
+**Lifecycle** (`captureApplicationLifecycleEvents`, default true):
+
+- `$app_installed` `{version, build}` on the first launch, and `$app_updated`
+  `{version, build, previous_version, previous_build}` when either changed since the last
+  launch. The version seen is kept in UserDefaults (`apphelm.appVersion`, `apphelm.appBuild`).
+  An app that already used an earlier Apphelm (it has a stored distinct id or install record)
+  is not counted as a new install the first time this version runs. Not detected with
+  `.memory`.
+- `$app_opened` `{from_background, version, build}`: once at launch (`from_background:
+  false`) and on each return from the background (`true`). A brief interruption, such as a
+  call alert, is not an open. `$app_backgrounded` when the app goes to the background. These
+  two need UIKit.
+- `$install` from `recordInstall()` is separate: it is the ad-measurement install (below).
+
+**Screens.** `screen(name, properties:)` sends `$screen` with `$screen_name`. With
+`captureScreenViews` (default true) every UIKit view controller that appears sends one too:
+`viewDidAppear` is swizzled once, and the name is the type name without `ViewController`
+(`CheckoutViewController` → `Checkout`). Navigation, tab, split and page controllers, a child
+inside another screen, SwiftUI hosting controllers and the system's own controllers are left
+out. A controller can name itself, or opt out by returning nil, with `ApphelmScreenNaming`
+(`var apphelmScreenName: String?`). In SwiftUI, `.apphelmScreen("Name", properties:)` sends a
+`$screen` each time the view appears, with the client in `.environment(\.apphelm, client)`,
+or else the client created most recently.
+
+**Identity and groups**, the same contract as the server and the other SDKs:
+
+- `identify(distinctId, traits:)` sends `$identify` with `distinct_id` set to the new id,
+  `$anon_distinct_id` set to the anonymous id used until then, and `$set` with the traits.
+  Later events carry the new id, which is kept across launches. Identifying again as the
+  same person without traits sends nothing; identifying as someone else while identified
+  sends no `$anon_distinct_id`, so two people are never merged. Call `reset()` at log-out.
+- `alias(alias)` sends `$create_alias` with `alias`, from the current id.
+- `group(type:key:traits:)` puts `$groups` `{type: key}` on every later event (kept across
+  launches; `groups` reads them) and, with traits, sends `$groupidentify` with `$group_type`,
+  `$group_key` and `$group_set`.
+- `register(properties)` / `unregister(key)`: super properties on every later event, kept
+  across launches. An event's own properties win.
+- `reset()`: a new anonymous id, and no identified id, super properties or groups. Opt-out is
+  kept. A `distinctId` passed in `ApphelmOptions` still wins on the next launch.
+- `identify(externalUserId:traits:traitSources:)` is unchanged: it posts the
+  provenance-checked customer profile (`apphelm.identify`) at once and does not change the
+  distinct id. Use both when you keep customer profiles: the first for analytics identity,
+  the second for the profile.
+
+Customer signals (`apphelm.identify`, `apphelm.group`, `apphelm.goal`, `apphelm.outcome`)
+carry no super properties, groups or `$ad_consent`: the server holds them to a strict shape.
+
+**Opt-out.** `optOut()` deletes the queue and stops everything being queued or sent: events,
+screens, lifecycle events, exceptions, crash reports (deleted, not sent later),
+transactions and both identifies. `optIn()` turns it back on. The choice is kept in
+UserDefaults (`apphelm.optedOut`); `defaultOptedOut: true` starts opted out until `optIn()`.
+Flag checks and surveys still work while opted out.
+
+Upgrading from 0.5: `screen` sends `$screen` with `$screen_name` (it was `page_viewed` with
+`path`), events are sent without calling `flush()`, and the queue is on disk and holds 1000.
 
 ## Release health
 
@@ -36,7 +130,7 @@ apphelm.endSession()
 with the release, the environment and a new session id. It needs `release`: the server
 counts sessions per release, so without one it returns `nil` and queues nothing. Calling it
 while a session is running returns that session. The event is queued like a tracked event
-and is sent by `flush()`. It is the only event a session costs.
+and is sent with the next flush. It is the only event a session costs.
 
 `endSession()` sends nothing. It ends the session locally, so later errors carry no session
 id and the next `startSession()` starts a new session. There is no closing event because
@@ -222,6 +316,49 @@ apphelm.setAdsConsent(.measurement) // or nil to stop
 - No App Tracking Transparency prompt, and no advertising identifier (IDFA) is read: the
   attribution token does not need either. AdServices is a system framework; the package
   still has no dependencies.
+
+## Session replay (wireframe)
+
+Replay records each screen as a wireframe: the position, size and colours of its views, their
+text (masked as below) and taps. It is not video and no pixels are captured. A new wireframe is
+taken only when the screen changes (checked once a second); chunks upload every few seconds and
+when the app goes to the background.
+
+It is off until you set `replay` and declare the person's consent. Consent is yours to collect;
+Apphelm does not ask.
+
+```swift
+var options = ApphelmOptions(apiKey: "ahl_live_…", workspaceId: "org_…", productId: "prd_…")
+options.replay = ReplayOptions(projectKey: "ahl_pub_…", origin: "https://app.example.com")
+let client = ApphelmClient(options: options)
+
+// From your consent prompt:
+client.setReplayConsent(true)   // starts recording
+client.setReplayConsent(false)  // stops at once and discards anything not yet sent
+```
+
+- **Key and origin.** Replay uploads to the browser collector (`/api/replay`) with the product's
+  project key (`ahl_pub_…`) and one of the origins that key allows, like surveys. Without
+  `projectKey`/`origin` the `surveyKey`/`surveyOrigin` pair is used. A key that is not a project
+  key is refused: replay stays off and nothing is sent. Add the origin to the key's allowed
+  origins in Setup.
+- **Masking (defaults).** Text fields show asterisks (`maskAllTextInputs`, default true).
+  Password fields (`isSecureTextEntry`, or a password content type) are always `********`, never
+  their value or length. `maskAllText: true` masks labels and button titles too. Images are
+  drawn as placeholders and web views as empty boxes.
+- **Blocking and masking a view.** `view.apphelmReplayNoCapture = true` draws the view as an
+  empty box and records nothing inside it; `view.apphelmReplayMask = true` masks its text and
+  its children's. An `accessibilityIdentifier` containing `ph-no-capture`/`apphelm-no-capture`
+  or `ph-mask`/`apphelm-mask` does the same.
+- **Screens not recorded.** Sign-in, sign-up, checkout, payment, billing and admin screens are
+  paused, as on the web; add more by name with `blockedScreens`. Screen names come from
+  `screen(_:)` (UIKit screens are captured on their own).
+- **Lifecycle.** `reset()` ends the recording; coming back after 30 minutes in the background
+  starts a new one. Opting out of analytics stops replay too. `isReplayActive` and
+  `replaySessionId` tell you the state; `flushReplay()` uploads now.
+- **Not captured.** Keyboard, alerts and other windows than the key window, scroll offsets
+  inside a view beyond its frame, and SwiftUI content that is not backed by UIKit views (it shows
+  as the boxes of its hosting views, without its text).
 
 ## Symbolicating stripped builds
 

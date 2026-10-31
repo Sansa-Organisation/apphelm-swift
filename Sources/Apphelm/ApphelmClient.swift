@@ -58,6 +58,30 @@ public struct ApphelmOptions: Sendable {
   /// `recordInstall` sends the install's ad evidence for Yieldline. Change it later with
   /// `ApphelmClient.setAdsConsent`.
   public var adsConsent: AdsConsent? = nil
+  /// Flush every this many seconds (default 30). 0 turns the timer off.
+  public var flushIntervalSeconds: Double = 30
+  /// Flush as soon as this many events are queued (default 20). 0 turns it off.
+  public var flushAt: Int = 20
+  /// Flush when the app goes to the background, with background time to finish the send
+  /// (default true; UIKit apps).
+  public var flushOnBackground: Bool = true
+  /// The most events kept queued (default 1000); past it the oldest are dropped.
+  public var maxQueueSize: Int = 1000
+  /// Where the queue and the client's state are kept (default `.disk`: queued events
+  /// survive the app being killed).
+  public var persistence: ApphelmPersistence = .disk
+  /// Send `$app_installed`, `$app_updated`, `$app_opened` and `$app_backgrounded`
+  /// (default true). Opened and backgrounded need UIKit.
+  public var captureApplicationLifecycleEvents: Bool = true
+  /// Send a `$screen` each time a UIKit view controller appears (default true). SwiftUI
+  /// views use `.apphelmScreen("Name")` instead.
+  public var captureScreenViews: Bool = true
+  /// Start opted out of analytics until `optIn()` (default false). A choice made with
+  /// `optIn()` or `optOut()` is remembered and wins over this.
+  public var defaultOptedOut: Bool = false
+  /// Session replay of native screens as wireframes (nil, the default: off). Recording starts
+  /// only after `setReplayConsent(true)`. See `ReplayOptions`.
+  public var replay: ReplayOptions? = nil
 
   public init(apiKey: String, baseURL: String = "https://apphelm.dev", workspaceId: String, productId: String, distinctId: String? = nil, timeoutSeconds: Double = 10, release: String? = nil, environment: String? = nil, tracesSampleRate: Double = 1, tracePropagationHosts: [String] = [], adsConsent: AdsConsent? = nil) {
     self.adsConsent = adsConsent
@@ -96,9 +120,9 @@ private struct AcceptedEnvelope: Decodable {
   let accepted: Bool?
 }
 
-/// Native iOS/macOS client. URLSession only — no UIKit, no WebKit, no JavaScript.
-/// Telemetry queue is in-memory and bounded (100 events, oldest dropped),
-/// the same semantics as the browser SDK queue.
+/// Native iOS/macOS client on URLSession. Events are queued on disk (bounded, oldest
+/// dropped) and flushed on a timer, at a queue length and when the app goes to the
+/// background. UIKit is used only where it exists, for lifecycle events and screen views.
 public final class ApphelmClient: Sendable {
   private let options: ApphelmOptions
   private let session: URLSession
@@ -107,7 +131,23 @@ public final class ApphelmClient: Sendable {
   private let attributionToken: AttributionTokenProvider
   private let lock = NSLock()
   private var _distinctId: String
-  private var queue: [[String: Any]] = []
+  private let queue: EventQueue
+  private let state: ClientState
+  private let appInfo: AppInfo
+  private var _anonymousId: String
+  private var _identified: Bool
+  private var _superProperties: [String: Any]
+  private var _groups: [String: String]
+  private var _optedOut: Bool
+  // Flushes run one after another; each waits for the one before.
+  private var flushTail: Task<Void, Never>?
+  private var thresholdFlushRunning = false
+  // Set after a flush that could not reach the server, so each new event doesn't retry.
+  private var thresholdSuspended = false
+  private var flushTimer: (any RepeatingTimer)?
+  private var lifecycleObserver: AnyObject?
+  private var appActive = false
+  private var wasBackgrounded = false
   private var exposed: Set<String> = []
   private var health: (hash: String, clock: TraceClock, directory: URL)?
   // The most recently started transaction, held weakly: an abandoned one is not kept alive.
@@ -116,21 +156,28 @@ public final class ApphelmClient: Sendable {
   // Set once this client has queued (or found) the install, so it is queued at most once
   // even when the install record cannot be saved.
   private var installClaimed = false
+  private var replayRecorder: ReplayRecorder?
+  // Told of each event tracked while opted in (automatic surveys): its name and screen name.
+  private var captureObserver: (@Sendable (String, String?) -> Void)?
 
   /// `installStore` remembers that `$install` was sent (`UserDefaultsInstallRecordStore` by default).
   public convenience init(options: ApphelmOptions, session: URLSession = .shared, store: (any DistinctIdStore)? = nil, installStore: (any InstallRecordStore)? = nil) {
     self.init(options: options, session: session, store: store, installStore: installStore, attributionToken: appleAdsAttributionToken)
   }
 
-  init(options: ApphelmOptions, session: URLSession, store: (any DistinctIdStore)?, installStore: (any InstallRecordStore)?, attributionToken: @escaping AttributionTokenProvider) {
+  init(options: ApphelmOptions, session: URLSession, store: (any DistinctIdStore)?, installStore: (any InstallRecordStore)?, attributionToken: @escaping AttributionTokenProvider, timerFactory: RepeatingTimerFactory = dispatchTimerFactory, appInfo: AppInfo? = nil) {
     self.options = options
     self.session = session
-    self.installStore = installStore ?? UserDefaultsInstallRecordStore()
+    let resolvedInstallStore = installStore ?? UserDefaultsInstallRecordStore()
+    self.installStore = resolvedInstallStore
     self.attributionToken = attributionToken
     self._adsConsent = options.adsConsent
     let resolvedStore: any DistinctIdStore = store ?? UserDefaultsStore()
     self.store = resolvedStore
-    if let explicit = options.distinctId?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+    // An app that used Apphelm before this version has an id or an install record already.
+    let usedBefore = !(resolvedStore.load() ?? "").isEmpty || resolvedInstallStore.isInstallRecorded()
+    let explicit = options.distinctId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !explicit.isEmpty {
       self._distinctId = explicit
     } else if let stored = resolvedStore.load(), !stored.isEmpty {
       self._distinctId = stored
@@ -138,6 +185,106 @@ public final class ApphelmClient: Sendable {
       let generated = UUID().uuidString
       resolvedStore.save(generated)
       self._distinctId = generated
+    }
+    switch options.persistence {
+    case .disk:
+      state = ClientState(defaults: .standard)
+      queue = EventQueue.shared(directory: defaultQueueDirectory(options: options), maxSize: options.maxQueueSize)
+    case .directory(let directory, let suiteName):
+      state = ClientState(defaults: suiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard)
+      queue = EventQueue.shared(directory: directory, maxSize: options.maxQueueSize)
+    case .memory:
+      state = ClientState(defaults: nil)
+      queue = EventQueue(directory: nil, maxSize: options.maxQueueSize)
+    }
+    self.appInfo = appInfo ?? AppInfo.main()
+    _optedOut = state.bool(ClientState.optedOut) ?? options.defaultOptedOut
+    // An id passed in options is taken as an identified person, as before.
+    _identified = !explicit.isEmpty || state.bool(ClientState.identified) == true
+    let storedAnonymous = state.string(ClientState.anonymousId) ?? ""
+    _anonymousId = !storedAnonymous.isEmpty ? storedAnonymous : (_identified ? UUID().uuidString : _distinctId)
+    _superProperties = state.object(ClientState.superProperties)
+    _groups = state.object(ClientState.groups).compactMapValues { $0 as? String }
+    if storedAnonymous.isEmpty { state.set(_anonymousId, ClientState.anonymousId) }
+
+    detectInstallOrUpdate(usedBefore: usedBefore)
+    if options.flushIntervalSeconds > 0 {
+      flushTimer = timerFactory(options.flushIntervalSeconds) { [weak self] in
+        guard let self, self.queue.count > 0 else { return }
+        Task { await self.flush() }
+      }
+    }
+    #if canImport(UIKit) && !os(watchOS)
+    if options.captureApplicationLifecycleEvents || options.flushOnBackground { lifecycleObserver = LifecycleObserver(client: self) }
+    #endif
+    if options.captureScreenViews { ScreenCapture.register(self) }
+    if let replay = options.replay {
+      let uploader = ReplayUploader(baseURL: options.baseURL, key: replay.projectKey ?? options.surveyKey, origin: replay.origin ?? options.surveyOrigin, timeout: options.timeoutSeconds, session: session)
+      replayRecorder = ReplayRecorder(options: replay, workspaceId: options.workspaceId, productId: options.productId,
+        person: { [weak self] in
+          guard let self else { return ReplayRecorder.Person(distinctId: "", identified: false) }
+          return ReplayRecorder.Person(distinctId: self.distinctId, identified: self.lock.withLock { self._identified })
+        },
+        sessionHash: { [weak self] in self?.sessionId },
+        allowed: { [weak self] in self.map { !$0.isOptedOut } ?? false },
+        send: uploader.map { uploader -> ReplayRecorder.Sender in { body in await uploader.send(body) } })
+    }
+    Self.latestLock.withLock { Self._latest = self }
+  }
+
+  deinit {
+    flushTimer?.cancel()
+  }
+
+  private static let latestLock = NSLock()
+  nonisolated(unsafe) private static weak var _latest: ApphelmClient?
+  /// The client created most recently, for `.apphelmScreen` without a client.
+  static var latest: ApphelmClient? { latestLock.withLock { _latest } }
+
+  /// `$app_installed` on the first launch, `$app_updated` when the version or build changed
+  /// since the last one. The version seen is kept in the state, so this needs persistence.
+  /// An app that used Apphelm before this version is not counted as a new install.
+  private func detectInstallOrUpdate(usedBefore: Bool) {
+    guard state.isPersistent else { return }
+    let previousVersion = state.string(ClientState.appVersion)
+    let previousBuild = state.string(ClientState.appBuild)
+    state.set(appInfo.version, ClientState.appVersion)
+    state.set(appInfo.build, ClientState.appBuild)
+    guard options.captureApplicationLifecycleEvents else { return }
+    if previousVersion == nil && previousBuild == nil {
+      if !usedBefore { enqueue("$app_installed", properties: ["version": appInfo.version, "build": appInfo.build]) }
+    } else if previousVersion != appInfo.version || previousBuild != appInfo.build {
+      enqueue("$app_updated", properties: ["version": appInfo.version, "build": appInfo.build, "previous_version": previousVersion ?? "", "previous_build": previousBuild ?? ""])
+    }
+  }
+
+  /// The app became active: `$app_opened`, once per launch and once per return from the
+  /// background (not after a brief interruption such as a call alert).
+  func applicationDidBecomeActive() {
+    let fromBackground: Bool? = lock.withLock {
+      if appActive { return nil }
+      appActive = true
+      return wasBackgrounded
+    }
+    replayRecorder?.visibility(hidden: false)
+    guard let fromBackground, options.captureApplicationLifecycleEvents else { return }
+    enqueue("$app_opened", properties: ["from_background": fromBackground, "version": appInfo.version, "build": appInfo.build])
+  }
+
+  /// The app went to the background: `$app_backgrounded`, then a flush. `finish` is called
+  /// when the flush is over (it ends the background task).
+  func applicationDidEnterBackground(finish: @escaping @Sendable () -> Void = {}) {
+    lock.withLock {
+      appActive = false
+      wasBackgrounded = true
+    }
+    if options.captureApplicationLifecycleEvents { enqueue("$app_backgrounded", properties: [:]) }
+    replayRecorder?.visibility(hidden: true)
+    if let replay = replayRecorder { Task { await replay.flush() } }
+    guard options.flushOnBackground else { finish(); return }
+    Task {
+      await self.flush()
+      finish()
     }
   }
 
@@ -174,21 +321,168 @@ public final class ApphelmClient: Sendable {
     return try JSONDecoder().decode(T.self, from: data)
   }
 
-  /// Enqueue one event. Oldest events drop past 100 queued.
+  /// Enqueue one event. Past `maxQueueSize` queued, the oldest are dropped. Nothing is
+  /// queued while opted out.
   public func track(_ name: String, properties: [String: Any] = [:]) {
     let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return }
     enqueue(trimmed, properties: properties)
+    if let observer = lock.withLock({ _optedOut ? nil : captureObserver }) { observer(trimmed, properties["$screen_name"] as? String) }
   }
 
-  private func enqueue(_ trimmed: String, properties: [String: Any]) {
-    lock.withLock {
-      var properties = properties
+  /// Set or clear the observer of tracked events (one at a time).
+  func setCaptureObserver(_ observer: (@Sendable (String, String?) -> Void)?) {
+    lock.withLock { captureObserver = observer }
+  }
+
+  /// `distinctId` overrides the current id (for `$identify`).
+  private func enqueue(_ trimmed: String, properties: [String: Any], distinctId: String? = nil) {
+    let length: Int? = lock.withLock {
+      if _optedOut { return nil }
+      let signal = customerSignalEvents.contains(trimmed)
+      // Super properties and groups first; the event's own properties win.
+      var merged: [String: Any] = signal ? [:] : _superProperties
+      if !signal, !_groups.isEmpty { merged["$groups"] = _groups }
+      merged.merge(properties) { _, own in own }
       // The consent the event was tracked under, not the one in force when it is flushed.
-      if let consent = _adsConsent, !customerSignalEvents.contains(trimmed) { properties["$ad_consent"] = consent.rawValue }
+      if let consent = _adsConsent, !signal { merged["$ad_consent"] = consent.rawValue }
+      // The person at track time: an event tracked before identify stays the anonymous one's.
+      merged["distinct_id"] = distinctId ?? _distinctId
       // The id and time are fixed at track time, so a resend after a lost response is stored once.
-      queue.append(["eventName": trimmed, "properties": properties, "eventId": UUID().uuidString, "occurredAt": ISO8601DateFormatter().string(from: Date())])
-      while queue.count > 100 { queue.removeFirst() }
+      return queue.append(["eventName": trimmed, "properties": jsonSafe(merged), "eventId": UUID().uuidString, "occurredAt": ISO8601DateFormatter().string(from: Date())])
+    }
+    guard let length, options.flushAt > 0, length >= options.flushAt else { return }
+    let start: Bool = lock.withLock {
+      if thresholdFlushRunning || thresholdSuspended { return false }
+      thresholdFlushRunning = true
+      return true
+    }
+    guard start else { return }
+    Task {
+      await self.flush()
+      self.lock.withLock { self.thresholdFlushRunning = false }
+    }
+  }
+
+  /// Whether analytics is off for this person: nothing is queued or sent.
+  public var isOptedOut: Bool {
+    lock.withLock { _optedOut }
+  }
+
+  /// Stop analytics: queued events are deleted, and nothing is queued or sent (events,
+  /// screens, exceptions, crash reports, transactions, identify) until `optIn()`. Flags and
+  /// surveys still work. Remembered across launches.
+  public func optOut() {
+    lock.withLock {
+      _optedOut = true
+      state.set(true, ClientState.optedOut)
+      queue.clear()
+    }
+  }
+
+  /// Turn analytics back on. Remembered across launches.
+  public func optIn() {
+    lock.withLock {
+      _optedOut = false
+      state.set(false, ClientState.optedOut)
+    }
+  }
+
+  /// Link this device's events to a person: sends `$identify` with `distinct_id` set to
+  /// `distinctId` and `$anon_distinct_id` set to the anonymous id used until now, plus
+  /// `$set` with `traits` when given. Later events carry `distinctId`, kept across
+  /// launches. Identifying as someone else while already identified sends no
+  /// `$anon_distinct_id`, so two people are never merged; call `reset()` at log-out.
+  ///
+  /// For the provenance-checked customer profile, use `identify(externalUserId:traits:traitSources:)`.
+  public func identify(_ distinctId: String, traits: [String: Any] = [:]) {
+    let id = distinctId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty else { return }
+    let anonymous: String?? = lock.withLock {
+      if _identified && _distinctId == id && traits.isEmpty { return .none }
+      // Only an anonymous person is merged: re-identifying, or switching people, merges nothing.
+      let previous: String? = _identified ? nil : _anonymousId
+      _distinctId = id
+      _identified = true
+      return .some(previous)
+    }
+    guard case .some(let previous) = anonymous else { return }
+    store.save(id)
+    state.set(true, ClientState.identified)
+    var properties: [String: Any] = [:]
+    if let previous, previous != id { properties["$anon_distinct_id"] = previous }
+    if !traits.isEmpty { properties["$set"] = traits }
+    enqueue("$identify", properties: properties, distinctId: id)
+  }
+
+  /// Tell Apphelm `alias` is another id of the current person: sends `$create_alias` with
+  /// `alias`, from the current id.
+  public func alias(_ alias: String) {
+    let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed != distinctId else { return }
+    enqueue("$create_alias", properties: ["alias": trimmed])
+  }
+
+  /// Put this person in a group (`type` such as `company`, `key` its id): every later event
+  /// carries `$groups` `{type: key}`, kept across launches. With `traits`, also sends
+  /// `$groupidentify` with `$group_type`, `$group_key` and `$group_set`.
+  public func group(type: String, key: String, traits: [String: Any] = [:]) {
+    let groupType = type.trimmingCharacters(in: .whitespacesAndNewlines)
+    let groupKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !groupType.isEmpty, !groupKey.isEmpty else { return }
+    let groups: [String: String] = lock.withLock {
+      _groups[groupType] = groupKey
+      return _groups
+    }
+    state.setObject(groups, ClientState.groups)
+    if !traits.isEmpty { enqueue("$groupidentify", properties: ["$group_type": groupType, "$group_key": groupKey, "$group_set": traits]) }
+  }
+
+  /// The groups later events carry as `$groups`.
+  public var groups: [String: String] {
+    lock.withLock { _groups }
+  }
+
+  /// Super properties: sent with every later event, kept across launches. An event's own
+  /// properties win over them.
+  public func register(_ properties: [String: Any]) {
+    let all: [String: Any] = lock.withLock {
+      _superProperties.merge(jsonSafe(properties) as? [String: Any] ?? [:]) { _, new in new }
+      return _superProperties
+    }
+    state.setObject(all, ClientState.superProperties)
+  }
+
+  /// Stop sending one super property.
+  public func unregister(_ key: String) {
+    let all: [String: Any] = lock.withLock {
+      _superProperties.removeValue(forKey: key)
+      return _superProperties
+    }
+    state.setObject(all, ClientState.superProperties)
+  }
+
+  /// At log-out: a new anonymous id, and no identified id, super properties or groups.
+  /// Events already queued keep the id they were tracked with. Opt-out is kept.
+  public func reset() {
+    let fresh = UUID().uuidString
+    lock.withLock {
+      _distinctId = fresh
+      _anonymousId = fresh
+      _identified = false
+      _superProperties = [:]
+      _groups = [:]
+      exposed = []
+    }
+    store.save(fresh)
+    state.set(fresh, ClientState.anonymousId)
+    state.set(false, ClientState.identified)
+    state.set(nil, ClientState.superProperties)
+    state.set(nil, ClientState.groups)
+    // A new person: the recording so far ends, and the next one starts fresh.
+    if let replay = replayRecorder {
+      replay.personChanged()
+      Task { await replay.flush() }
     }
   }
 
@@ -225,6 +519,7 @@ public final class ApphelmClient: Sendable {
   /// queued at most once per client. Returns whether it was queued by this call.
   @discardableResult
   public func recordInstall(appVersion: String? = nil) async -> Bool {
+    guard !isOptedOut else { return false }
     let claimed: Bool = lock.withLock {
       if installClaimed { return false }
       installClaimed = true
@@ -246,44 +541,99 @@ public final class ApphelmClient: Sendable {
     return true
   }
 
-  /// Screen view. Sent as `page_viewed` with the screen name as path.
+  /// Screen view: `$screen` with the name as `$screen_name`.
   public func screen(_ name: String, properties: [String: Any] = [:]) {
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
     var merged = properties
-    merged["path"] = String(name.prefix(300))
-    track("page_viewed", properties: merged)
+    merged["$screen_name"] = String(trimmed.prefix(300))
+    track("$screen", properties: merged)
+    replayRecorder?.screenChanged(trimmed)
   }
 
-  /// Flush queued events through `ingest`. Failed batches stay queued for the next flush.
-  public func flush() async {
-    let batch: [[String: Any]] = lock.withLock {
-      let pending = queue
-      queue = []
-      return pending
-    }
-    guard !batch.isEmpty else { return }
-    // One request per event, so a failure part-way through puts back only the events not
-    // yet accepted. Re-queuing the whole batch sent every earlier event a second time.
-    var sent = 0
-    do {
-      for event in batch {
-        var properties = (event["properties"] as? [String: Any]) ?? [:]
-        properties["distinct_id"] = distinctId
-        let envelope: AcceptedEnvelope = try await send(path: "/events", body: [
-          "workspaceId": options.workspaceId,
-          "productId": options.productId,
-          "eventName": event["eventName"] as? String ?? "unknown_event",
-          "privacyMode": "strict",
-          "properties": properties,
-          "eventId": event["eventId"] as? String ?? UUID().uuidString,
-          "occurredAt": event["occurredAt"] as? String ?? ISO8601DateFormatter().string(from: Date()),
-        ])
-        _ = envelope
-        sent += 1
+  /// Declare that the person agreed to session replay (`ApphelmOptions.replay` must be set).
+  /// With true, screens are recorded as wireframes; with false, recording stops at once and
+  /// anything not yet sent is discarded. Apphelm does not ask: call it from your consent prompt.
+  public func setReplayConsent(_ granted: Bool) {
+    guard let recorder = replayRecorder else { return }
+    recorder.setConsent(granted)
+    #if canImport(UIKit) && !os(watchOS)
+    DispatchQueue.main.async {
+      MainActor.assumeIsolated {
+        if granted && recorder.isConfigured { ReplayUIKitCapture.start(recorder) } else { ReplayUIKitCapture.stop(recorder) }
       }
-    } catch {
-      let unsent = Array(batch.dropFirst(sent))
-      lock.withLock { queue = Array((unsent + queue).suffix(100)) }
     }
+    #endif
+  }
+
+  /// True while screens are being recorded: replay configured, consent given, not opted out.
+  public var isReplayActive: Bool { replayRecorder?.isActive ?? false }
+
+  /// The current replay recording's id (`rpl_…`), or nil when none is running.
+  public var replaySessionId: String? { replayRecorder?.sessionId }
+
+  /// Send the replay chunks waiting now (they are also sent every few seconds on their own).
+  public func flushReplay() async {
+    await replayRecorder?.flush()
+  }
+
+  /// For tests: the recorder.
+  var replayRecorderForTests: ReplayRecorder? { replayRecorder }
+
+  /// Send queued events now. Events that fail to send stay queued, in order, for the next
+  /// flush; flushes run one at a time, so none is sent twice. The client also flushes on
+  /// its own (`flushIntervalSeconds`, `flushAt`, `flushOnBackground`).
+  public func flush() async {
+    let task: Task<Void, Never> = lock.withLock {
+      let previous = flushTail
+      let task = Task {
+        await previous?.value
+        await self.drain()
+      }
+      flushTail = task
+      return task
+    }
+    await task.value
+  }
+
+  /// One request per event, so a failure part-way through puts back only the events not
+  /// yet accepted. Re-queuing the whole batch sent every earlier event a second time.
+  private func drain() async {
+    let batch = queue.takePending()
+    guard !batch.isEmpty else { return }
+    for (index, entry) in batch.enumerated() {
+      if isOptedOut {
+        queue.release(batch.dropFirst(index).map(\.id))
+        return
+      }
+      do {
+        try await sendQueued(entry.event)
+        queue.complete(entry.id)
+      } catch let error as ApphelmError where [400, 413, 422].contains(error.status) {
+        // Refused for good: resending can't succeed, and it would hold up the queue forever.
+        queue.complete(entry.id)
+      } catch {
+        queue.release(batch.dropFirst(index).map(\.id))
+        lock.withLock { thresholdSuspended = true }
+        return
+      }
+    }
+    lock.withLock { thresholdSuspended = false }
+  }
+
+  private func sendQueued(_ event: [String: Any]) async throws {
+    var properties = (event["properties"] as? [String: Any]) ?? [:]
+    if properties["distinct_id"] == nil { properties["distinct_id"] = distinctId }
+    let envelope: AcceptedEnvelope = try await send(path: "/events", body: [
+      "workspaceId": options.workspaceId,
+      "productId": options.productId,
+      "eventName": event["eventName"] as? String ?? "unknown_event",
+      "privacyMode": "strict",
+      "properties": properties,
+      "eventId": event["eventId"] as? String ?? UUID().uuidString,
+      "occurredAt": event["occurredAt"] as? String ?? ISO8601DateFormatter().string(from: Date()),
+    ])
+    _ = envelope
   }
 
   /// Identify a person. Every trait needs explicit provenance: the API rejects a trait
@@ -299,6 +649,7 @@ public final class ApphelmClient: Sendable {
     if !unmatched.isEmpty {
       throw ApphelmError(message: "traitSources has no matching trait value for: \(unmatched.joined(separator: ", "))", status: 0, code: "trait_provenance_orphaned")
     }
+    guard !isOptedOut else { return }
     let envelope: AcceptedEnvelope = try await send(path: "/events", body: [
       "workspaceId": options.workspaceId,
       "productId": options.productId,
@@ -433,6 +784,11 @@ public final class ApphelmClient: Sendable {
   /// A survey request: the browser survey routes, with the project key and its origin.
   /// Returns the response's `data`, or nil when there is none.
   private func surveyPost(_ path: String, _ fields: [String: Any]) async throws -> OrderedJSONObject? {
+    try await surveyRequest(path, fields) as? OrderedJSONObject
+  }
+
+  /// A survey request's `data`, whatever its shape.
+  func surveyRequest(_ path: String, _ fields: [String: Any]) async throws -> Any? {
     let key = options.surveyKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let origin = options.surveyOrigin?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     guard !key.isEmpty, !origin.isEmpty, let url = URL(string: options.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path) else {
@@ -460,7 +816,7 @@ public final class ApphelmClient: Sendable {
       let details = payload["error"] as? OrderedJSONObject
       throw ApphelmError(message: details?["message"] as? String ?? "Apphelm survey request failed (\(http.statusCode)).", status: http.statusCode, code: details?["code"] as? String ?? "request_failed")
     }
-    return payload["data"] as? OrderedJSONObject
+    return payload["data"]
   }
 
   /// Ask whether there is a survey for this person now, the request the browser SDK's
@@ -479,9 +835,15 @@ public final class ApphelmClient: Sendable {
   /// nothing is shown by the client. Throws `ApphelmError` when the request fails, and
   /// with the code `survey_not_configured` without `surveyKey` and `surveyOrigin`, and
   /// `survey_key_not_public` for a key that is not a project key.
-  public func surveyEligible(triggerType: String, triggerSourceId: String, triggerKey: String? = nil, screen: String? = nil, externalUserId: String? = nil) async throws -> SurveyOffer? {
+  ///
+  /// `programId` asks for one automatically shown program (its trigger is not matched), and
+  /// `device` (`mobile`, `tablet`) is the device class its display rules target; automatic
+  /// surveys (`enableAutomaticSurveys`) send both.
+  public func surveyEligible(triggerType: String, triggerSourceId: String, triggerKey: String? = nil, screen: String? = nil, externalUserId: String? = nil, programId: String? = nil, device: String? = nil) async throws -> SurveyOffer? {
     var body: [String: Any] = ["triggerType": triggerType, "triggerSourceId": triggerSourceId]
     if let triggerKey { body["triggerKey"] = triggerKey }
+    if let programId { body["programId"] = programId }
+    if let device { body["device"] = device }
     let customer = externalUserId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     if !customer.isEmpty {
       body["externalUserId"] = customer
@@ -622,6 +984,7 @@ public final class ApphelmClient: Sendable {
 
   /// Transactions carry no person and no stack, as in the other clients.
   private func sendTransaction(_ properties: [String: Any]) async throws {
+    guard !isOptedOut else { return }
     let envelope: AcceptedEnvelope = try await send(path: "/events", body: [
       "workspaceId": options.workspaceId,
       "productId": options.productId,
@@ -649,6 +1012,7 @@ public final class ApphelmClient: Sendable {
     }
     // The person, as on every other event, so the issue counts the users it affects.
     merged["distinct_id"] = distinctId
+    guard !isOptedOut else { return }
     let envelope: AcceptedEnvelope = try await send(path: "/events", body: [
       "workspaceId": options.workspaceId,
       "productId": options.productId,
@@ -679,6 +1043,11 @@ public final class ApphelmClient: Sendable {
     let folder = directory ?? Self.defaultCrashDirectory()
     var sent = 0
     for report in CrashInstaller.pendingReports(directory: folder) {
+      // Opted out: the crash is not sent later either.
+      if isOptedOut {
+        CrashInstaller.remove(report: report)
+        continue
+      }
       guard var properties = CrashInstaller.exceptionProperties(report: report) else {
         CrashInstaller.remove(report: report)
         continue

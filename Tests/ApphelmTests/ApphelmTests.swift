@@ -138,7 +138,7 @@ struct LocalFlagTests {
 @Suite("Client transport", .serialized)
 struct ClientTests {
   func options() -> ApphelmOptions {
-    ApphelmOptions(apiKey: "ahl_live_test", workspaceId: "org_1", productId: "prd_1", distinctId: "user-1")
+    ApphelmOptions(apiKey: "ahl_live_test", workspaceId: "org_1", productId: "prd_1", distinctId: "user-1").quiet
   }
 
   @Test("Ingest posts to the events endpoint with a bearer key")
@@ -260,7 +260,7 @@ struct ClientTests {
     let store = MemoryStore()
     let client = ApphelmClient(options: options(), session: .shared, store: store)
     #expect(client.distinctId == "user-1")
-    let generated = ApphelmClient(options: ApphelmOptions(apiKey: "k", workspaceId: "o", productId: "p"), session: .shared, store: store)
+    let generated = ApphelmClient(options: ApphelmOptions(apiKey: "k", workspaceId: "o", productId: "p").quiet, session: .shared, store: store)
     #expect(store.load() == generated.distinctId)
   }
 }

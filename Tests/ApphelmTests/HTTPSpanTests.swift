@@ -11,7 +11,7 @@ private func spans(_ properties: [String: Any]) -> [[String: Any]] {
 @Suite("Automatic HTTP spans")
 struct HTTPSpanTests {
   func options(_ recorder: Recorder, rate: Double = 1, hosts: [String] = []) -> ApphelmOptions {
-    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", tracesSampleRate: rate, tracePropagationHosts: hosts)
+    ApphelmOptions(apiKey: "ahl_live_test", baseURL: recorder.baseURL, workspaceId: "org_1", productId: "prd_1", distinctId: "user-1", tracesSampleRate: rate, tracePropagationHosts: hosts).quiet
   }
 
   @Test("traceparent goes only to listed hosts: an exact host, or a leading dot for the hosts under a domain")
@@ -80,7 +80,7 @@ struct HTTPSpanTests {
     // startScreen also queued the screen view.
     await client.flush()
     let batch = String(describing: recorder.bodies.last ?? [:])
-    #expect(batch.contains("page_viewed") && batch.contains("CheckoutScreen"))
+    #expect(recorder.bodies.last?["eventName"] as? String == "$screen" && batch.contains("CheckoutScreen"))
   }
 
   @Test("An HTTP span's URL keeps scheme, host, a given port and path only")
