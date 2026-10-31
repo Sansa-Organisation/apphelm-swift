@@ -213,6 +213,49 @@ struct ClientTests {
     #expect(sent.first?["distinct_id"] as? String == "user-1")
   }
 
+  @Test("getFeatureFlag answers true for a boolean flag by flagType, the variant otherwise; the exposure keeps the served variant")
+  func featureFlagValues() async throws {
+    let lock = NSLock()
+    var exposures: [[String: Any]] = []
+    let rows: [String: [String: Any]] = [
+      "bool": ["enabled": true, "variant": "on", "flagType": "boolean", "experiment": true],
+      "multi-on": ["enabled": true, "variant": "on", "flagType": "multivariate"],
+      "multi": ["enabled": true, "variant": "test", "flagType": "multivariate"],
+      "remote": ["enabled": true, "variant": NSNull(), "flagType": "remote_config"],
+      "legacy-on": ["enabled": true, "variant": "on"],
+      "legacy-variant": ["enabled": true, "variant": "test"],
+      "control": ["enabled": false, "variant": "control", "flagType": "multivariate"],
+    ]
+    let session = stubbedSession { request in
+      if request.url?.path.hasSuffix("/flags/evaluate") == true {
+        let key = try requestJSON(request)["flagKey"] as? String ?? ""
+        var row: [String: Any] = ["key": key, "payload": NSNull(), "reason": "enabled"]
+        row.merge(rows[key] ?? ["enabled": false, "variant": NSNull()]) { $1 }
+        return try jsonResponse(url: request.url!, status: 200, body: ["object": "flag_evaluations", "failClosed": true, "data": [row]])
+      }
+      let body = try requestJSON(request)
+      if body["eventName"] as? String == "apphelm.flag_evaluated" { lock.withLock { exposures.append(body["properties"] as? [String: Any] ?? [:]) } }
+      return try jsonResponse(url: request.url!, status: 202, body: ["accepted": true, "eventId": "evt_1"])
+    }
+    let client = ApphelmClient(options: options(), session: session, store: MemoryStore())
+    #expect(await client.getFeatureFlag("bool") == .enabled)
+    #expect(await client.getFeatureFlag("multi-on") == .variant("on"))
+    #expect(await client.getFeatureFlag("multi") == .variant("test"))
+    #expect(await client.getFeatureFlag("remote") == .enabled)
+    #expect(await client.getFeatureFlag("legacy-on") == .enabled)
+    #expect(await client.getFeatureFlag("legacy-variant") == .variant("test"))
+    #expect(await client.getFeatureFlag("control") == .disabled)
+    #expect(await client.getFeatureFlag("missing") == .disabled)
+    #expect((await client.getFeatureFlag("bool")).anyValue as? Bool == true)
+    #expect((await client.getFeatureFlag("multi")).anyValue as? String == "test")
+    let local = evaluateLocalFlag(FlagConfig(key: "local", salt: "s"), distinctId: "user-1")
+    #expect(local.value == .enabled && local.variant == "on")
+    await client.flush()
+    let sent = lock.withLock { exposures }
+    #expect(sent.count == 1)
+    #expect(sent.first?["variant"] as? String == "on")
+  }
+
   @Test("A failed flush retries only the events not yet accepted")
   func retryWithoutDuplicates() async throws {
     let lock = NSLock()

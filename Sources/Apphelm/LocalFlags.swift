@@ -105,6 +105,49 @@ public struct FlagEvaluation: Sendable {
   public let variant: String?
   public let payload: JSONValue?
   public let reason: String
+  /// `"boolean"`, `"multivariate"` or `"remote_config"`. `nil` when a server before 0.7.0
+  /// answered, which did not say.
+  public var flagType: String? = nil
+
+  /// What `getFeatureFlag` answers: off, on (an enabled boolean or remote config flag) or the
+  /// variant of a multivariate flag. Without a `flagType`, the variant `"on"` reads as on:
+  /// that is what an enabled boolean flag serves.
+  public var value: FlagValue {
+    guard enabled else { return .disabled }
+    switch flagType {
+    case "multivariate": return variant.map(FlagValue.variant) ?? .enabled
+    case "boolean", "remote_config": return .enabled
+    default:
+      if let variant, variant != "on" { return .variant(variant) }
+      return .enabled
+    }
+  }
+}
+
+/// A flag's answer, as PostHog's `getFeatureFlag` gives it: `false`, `true`, or the variant.
+public enum FlagValue: Sendable, Equatable {
+  /// Off (the `control` variant counts as off), or not known: flags fail closed.
+  case disabled
+  /// An enabled boolean or remote config flag: PostHog's `true`.
+  case enabled
+  /// The variant of a multivariate flag.
+  case variant(String)
+
+  /// `true` unless the flag is off.
+  public var isEnabled: Bool { self != .disabled }
+  /// The variant, for a multivariate flag.
+  public var variant: String? {
+    if case .variant(let key) = self { return key }
+    return nil
+  }
+  /// PostHog's shape: `false`, `true` or the variant string.
+  public var anyValue: any Sendable {
+    switch self {
+    case .disabled: return false
+    case .enabled: return true
+    case .variant(let key): return key
+    }
+  }
 }
 
 /// Same assignment family as the server and every other SDK:
@@ -117,7 +160,7 @@ public func assignmentBucket(flagKey: String, distinctId: String, salt: String) 
 }
 
 private func off(_ flag: FlagConfig, reason: String) -> FlagEvaluation {
-  FlagEvaluation(key: flag.key, enabled: false, variant: flag.flagType == "multivariate" ? "control" : nil, payload: nil, reason: reason)
+  FlagEvaluation(key: flag.key, enabled: false, variant: flag.flagType == "multivariate" ? "control" : nil, payload: nil, reason: reason, flagType: flag.flagType)
 }
 
 /// Mirrors the server's scalar comparison so `42` and `"42"` target the same profile:
@@ -156,15 +199,15 @@ public func evaluateLocalFlag(_ flag: FlagConfig, distinctId: String, environmen
   let bucket = assignmentBucket(flagKey: flag.key, distinctId: distinctId, salt: flag.salt)
   if bucket >= flag.rolloutPercent { return off(flag, reason: "rollout") }
   if flag.flagType == "boolean" || flag.variants.isEmpty {
-    return FlagEvaluation(key: flag.key, enabled: true, variant: "on", payload: .bool(true), reason: "enabled")
+    return FlagEvaluation(key: flag.key, enabled: true, variant: "on", payload: .bool(true), reason: "enabled", flagType: "boolean")
   }
   var cursor = 0.0
   for variant in flag.variants {
     cursor += max(0, variant.percent)
     if bucket < cursor / 100.0 * flag.rolloutPercent || cursor >= 100 {
-      return FlagEvaluation(key: flag.key, enabled: variant.key != "control", variant: variant.key, payload: variant.payload, reason: "variant")
+      return FlagEvaluation(key: flag.key, enabled: variant.key != "control", variant: variant.key, payload: variant.payload, reason: "variant", flagType: "multivariate")
     }
   }
   let fallback = flag.variants[0]
-  return FlagEvaluation(key: flag.key, enabled: fallback.key != "control", variant: fallback.key, payload: fallback.payload, reason: "variant")
+  return FlagEvaluation(key: flag.key, enabled: fallback.key != "control", variant: fallback.key, payload: fallback.payload, reason: "variant", flagType: "multivariate")
 }

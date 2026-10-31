@@ -106,6 +106,10 @@ private struct EvaluationDTO: Decodable {
   let reason: String
   /// Set when a running experiment depends on the flag.
   let experiment: Bool?
+  /// boolean, multivariate or remote_config; absent from servers before 0.7.0.
+  let flagType: String?
+
+  var evaluation: FlagEvaluation { FlagEvaluation(key: key, enabled: enabled, variant: variant, payload: payload, reason: reason, flagType: flagType) }
 }
 
 private struct EvaluationsEnvelope: Decodable {
@@ -674,7 +678,22 @@ public final class ApphelmClient: Sendable {
   }
 
   public func evaluateFlags(flagKey: String? = nil, environment: String? = nil) async throws -> [FlagEvaluation] {
-    try await evaluationRows(flagKey: flagKey, environment: environment).map { FlagEvaluation(key: $0.key, enabled: $0.enabled, variant: $0.variant, payload: $0.payload, reason: $0.reason) }
+    try await evaluationRows(flagKey: flagKey, environment: environment).map(\.evaluation)
+  }
+
+  /// The flag's answer, as PostHog's `getFeatureFlag`: `.enabled` (PostHog's `true`) for an
+  /// enabled boolean or remote config flag, `.variant(key)` for a multivariate one, else
+  /// `.disabled`. Fail-closed: any transport or API failure is `.disabled`. Never throws.
+  /// For a flag a running experiment depends on, it also queues the exposure, with the
+  /// variant the server served (`"on"` for a boolean flag).
+  public func getFeatureFlag(_ flagKey: String, environment: String? = nil) async -> FlagValue {
+    do {
+      guard let row = try await evaluationRows(flagKey: flagKey, environment: environment).first(where: { $0.key == flagKey }) else { return .disabled }
+      if row.experiment == true { recordExposure(flagKey: row.key, variant: row.variant ?? (row.enabled ? "on" : "off")) }
+      return row.evaluation.value
+    } catch {
+      return .disabled
+    }
   }
 
   /// Fail-closed: any transport or API failure returns `false`. Never throws.

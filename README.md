@@ -3,7 +3,7 @@
 Swift Package Manager library on URLSession, with no dependencies. UIKit is used only where it
 exists, for lifecycle events, screen autocapture and background flushing; no WebKit, no JavaScript.
 
-- `ApphelmClient`: `track`, `screen` (`$screen`), `identify`, `alias`, `group`, `register`, `reset`, `optOut`, `evaluateFlags`, fail-closed `isEnabled`, `captureException`. Events wait in a queue on disk and are sent on their own (below); `flush()` sends them now.
+- `ApphelmClient`: `track`, `screen` (`$screen`), `identify`, `alias`, `group`, `register`, `reset`, `optOut`, `evaluateFlags`, fail-closed `isEnabled` and `getFeatureFlag`, `captureException`. Events wait in a queue on disk and are sent on their own (below); `flush()` sends them now.
 - Lifecycle events (`$app_installed`, `$app_updated`, `$app_opened`, `$app_backgrounded`) and UIKit screen views, captured automatically; `.apphelmScreen("Name")` for SwiftUI.
 - Crash capture: `installCrashReporting()` and `sendPendingCrashReports()` (uncaught `NSException`s and fatal signals, sent on the next launch).
 - Tracing: `startTransaction`, spans, W3C `traceparent`, and screen and `URLSession` spans without wrapping each call (below).
@@ -19,7 +19,7 @@ swift test
 Install with Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/Sansa-Organisation/apphelm-swift.git", from: "0.6.0")
+.package(url: "https://github.com/Sansa-Organisation/apphelm-swift.git", from: "0.7.0")
 // target dependency: .product(name: "Apphelm", package: "apphelm-swift")
 ```
 
@@ -112,6 +112,13 @@ screens, lifecycle events, exceptions, crash reports (deleted, not sent later),
 transactions and both identifies. `optIn()` turns it back on. The choice is kept in
 UserDefaults (`apphelm.optedOut`); `defaultOptedOut: true` starts opted out until `optIn()`.
 Flag checks and surveys still work while opted out.
+
+**Flags.** `getFeatureFlag(_:)` (0.7.0) answers as PostHog's does: `.enabled` (PostHog's
+`true`) for an enabled boolean or remote config flag, `.variant("test")` for a multivariate one,
+`.disabled` otherwise or on any failure; `.anyValue` gives `true`, `false` or the variant string.
+`FlagEvaluation.value` gives the same for a row from `evaluateFlags` or `evaluateLocalFlag`. For an
+experiment flag it queues the exposure with the variant the server served (`"on"` for a boolean
+flag). There is no `beforeSend` hook in the Swift SDK.
 
 Upgrading from 0.5: `screen` sends `$screen` with `$screen_name` (it was `page_viewed` with
 `path`), events are sent without calling `flush()`, and the queue is on disk and holds 1000.
