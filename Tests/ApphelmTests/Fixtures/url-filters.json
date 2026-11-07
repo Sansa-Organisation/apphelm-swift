@@ -1,0 +1,25 @@
+{
+  "about": "denyUrls / allowUrls cases every SDK runs (the JavaScript SDK's meaning, packages/sdk/src/event-filter.ts). frame is the file, path, module path or URL of the error's top stack frame (the innermost one, where it was raised), or null when it has none. A pattern is { \"string\": s } (dropped when the frame contains s; an empty string is ignored) or { \"regex\": r } (dropped when r finds a match anywhere in the frame, as a search, not a full match; the regexes use only syntax every SDK's engine shares). deny wins over allow; a non-empty allow list drops a frame none of its patterns match; an error without a frame is kept. drop is the reason the error is dropped (deny_urls or allow_urls), or null to keep it. Hand-written; tests/sdk-url-filters.test.ts checks the JavaScript SDK agrees. Copied into each SDK by generate.sh.",
+  "cases": [
+    { "name": "no filters keep everything", "frame": "/app/vendor/acme/client.rb", "denyUrls": [], "allowUrls": [], "drop": null },
+    { "name": "a deny string contained in the frame drops it", "frame": "/app/vendor/acme/client.rb", "denyUrls": [{ "string": "/vendor/" }], "allowUrls": [], "drop": "deny_urls" },
+    { "name": "a deny string not in the frame keeps it", "frame": "/app/lib/checkout.py", "denyUrls": [{ "string": "/vendor/" }], "allowUrls": [], "drop": null },
+    { "name": "strings match case-sensitively", "frame": "/app/vendor/acme/client.rb", "denyUrls": [{ "string": "/Vendor/" }], "allowUrls": [], "drop": null },
+    { "name": "a deny regex drops a URL it matches", "frame": "https://cdn.example.com/widget.min.js", "denyUrls": [{ "regex": "\\.min\\.js$" }], "allowUrls": [], "drop": "deny_urls" },
+    { "name": "a regex is a search, not a full match", "frame": "/srv/app/vendor/lib.php", "denyUrls": [{ "regex": "vendor" }], "allowUrls": [], "drop": "deny_urls" },
+    { "name": "an anchored regex that doesn't match keeps it", "frame": "/srv/app/vendor/lib.php", "denyUrls": [{ "regex": "^vendor/" }], "allowUrls": [], "drop": null },
+    { "name": "any one deny pattern is enough", "frame": "github.com/acme/retry/retry.go", "denyUrls": [{ "string": "/internal/" }, { "regex": "^github\\.com/acme/" }], "allowUrls": [], "drop": "deny_urls" },
+    { "name": "an allow list keeps a frame it matches", "frame": "/home/deploy/shop/app/models/order.rb", "denyUrls": [], "allowUrls": [{ "string": "/shop/app/" }], "drop": null },
+    { "name": "an allow list drops a frame none of it matches", "frame": "/usr/lib/python3.12/site-packages/requests/api.py", "denyUrls": [], "allowUrls": [{ "string": "/shop/app/" }, { "regex": "^/srv/shop/" }], "drop": "allow_urls" },
+    { "name": "an allow regex keeps a frame it matches", "frame": "/srv/shop/src/cart.ex", "denyUrls": [], "allowUrls": [{ "string": "/shop/app/" }, { "regex": "^/srv/shop/" }], "drop": null },
+    { "name": "deny wins over allow", "frame": "/home/deploy/shop/app/vendor/pay.rb", "denyUrls": [{ "string": "/vendor/" }], "allowUrls": [{ "string": "/shop/app/" }], "drop": "deny_urls" },
+    { "name": "no frame is kept despite a deny list", "frame": null, "denyUrls": [{ "regex": "." }], "allowUrls": [], "drop": null },
+    { "name": "no frame is kept despite an allow list", "frame": null, "denyUrls": [], "allowUrls": [{ "string": "/shop/app/" }], "drop": null },
+    { "name": "an empty deny string matches nothing", "frame": "/app/lib/checkout.py", "denyUrls": [{ "string": "" }], "allowUrls": [], "drop": null },
+    { "name": "a Windows path matches a string with backslashes", "frame": "C:\\build\\Shop\\Vendor\\Pay.cs", "denyUrls": [{ "string": "\\Vendor\\" }], "allowUrls": [], "drop": "deny_urls" },
+    { "name": "a Dart package URI matches", "frame": "package:shop/cart/checkout.dart", "denyUrls": [], "allowUrls": [{ "regex": "^package:shop/" }], "drop": null },
+    { "name": "a JVM module path is dropped by an allow list that doesn't name it", "frame": "okhttp3/internal/connection/RealCall.kt", "denyUrls": [], "allowUrls": [{ "regex": "^com/shop/" }], "drop": "allow_urls" },
+    { "name": "alternation in a regex", "frame": "/app/node_modules/lib/index.js", "denyUrls": [{ "regex": "/(vendor|node_modules)/" }], "allowUrls": [], "drop": "deny_urls" },
+    { "name": "a character class in a regex", "frame": "/app/gen/model_v2.pb.go", "denyUrls": [{ "regex": "_v[0-9]+\\.pb\\.go$" }], "allowUrls": [], "drop": "deny_urls" }
+  ]
+}

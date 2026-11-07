@@ -80,7 +80,7 @@ final class ReplayUIKitCapture: NSObject, UIGestureRecognizerDelegate {
   }
 
   func tick() {
-    guard recorder.isActive, let window = keyWindow() else { return }
+    guard recorder.isActive, recorder.wantsFrames, let window = keyWindow() else { return }
     if tappedWindow !== window {
       if let recognizer { recognizer.view?.removeGestureRecognizer(recognizer) }
       let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))

@@ -37,10 +37,13 @@ public struct ApphelmOptions: Sendable {
   /// issues show where they happen and "resolve in next release" works.
   public var release: String?
   public var environment: String?
-  /// The share of transactions started here that are kept, 0–1 (default 1: every
-  /// `startTransaction` is sent). A transaction continuing an incoming `traceparent` keeps
-  /// the caller's decision instead. Each kept transaction is one event.
-  public var tracesSampleRate: Double
+  /// The share of transactions started here that are kept, 0–1, or nil (the default: not
+  /// set). While neither it nor `tracesSampler` is set, automatic tracing (screen loads from
+  /// `enableUIViewControllerTracing`, app starts from `enableAppStartTracking`) is off, and
+  /// transactions you start yourself with `startTransaction`/`startScreen` are kept at a rate
+  /// of 1. Once set, it applies to both. A transaction continuing an incoming `traceparent`
+  /// keeps the caller's decision instead. Each kept transaction is one event.
+  public var tracesSampleRate: Double?
   /// The hosts automatic HTTP spans send `traceparent` to, so their transactions join the
   /// app's trace: your own services only, since the header tells the receiver the trace id.
   /// An entry is one host (`api.example.com`) or, with a leading dot, every host under a
@@ -82,8 +85,153 @@ public struct ApphelmOptions: Sendable {
   /// Session replay of native screens as wireframes (nil, the default: off). Recording starts
   /// only after `setReplayConsent(true)`. See `ReplayOptions`.
   public var replay: ReplayOptions? = nil
+  /// Called with the properties of every event before it is queued or sent: events you
+  /// track, screens, identify, alias and group events, flag exposures, sessions,
+  /// exceptions, messages, crash reports and transactions (the same hook as Kotlin's). The
+  /// dictionary also holds the event's name as `$event_name` (read-only: it is removed
+  /// before sending). Return the properties, changed or not, to send the event, or nil to
+  /// drop it; a result that can't be sent as JSON also drops it. Keep it quick: it runs on
+  /// the thread that tracks the event. Exceptions, messages, crash reports and transactions
+  /// reach it already scrubbed: secrets and emails in messages, stack frames, tags,
+  /// breadcrumbs, span names, descriptions and data are replaced (`[key]`, `[email]`,
+  /// `[redacted]`…) and URLs lose their query, fragment and user info. That can't be turned
+  /// off. What the hook returns is sent as it is; the server scrubs again either way.
+  public var beforeSend: (@Sendable ([String: Any]) -> [String: Any]?)? = nil
+  /// Called with each breadcrumb before it is kept: return it (changed or not), or nil to
+  /// drop it. Automatic breadcrumbs pass through it too.
+  public var beforeBreadcrumb: (@Sendable (Breadcrumb) -> Breadcrumb?)? = nil
+  /// The most breadcrumbs kept on the device (default 100; 0 keeps none). Each event
+  /// carries the last 30.
+  public var maxBreadcrumbs: Int = 100
+  /// Record breadcrumbs on their own (default true): screens (`navigation`), the app coming
+  /// to the foreground and going to the background (`app.lifecycle`), low-memory warnings
+  /// (`device.event`), requests made through `data(for:)` or `httpSpanDelegate()` (`http`)
+  /// and, on UIKit, controls sending actions (`ui.click`, the action and the target's type,
+  /// never a label's text).
+  public var enableAutoBreadcrumbs: Bool = true
+  /// Start release-health sessions on their own (default true; needs `release`): one when
+  /// the app comes to the foreground, ended once it has been in the background for
+  /// `sessionTrackingIntervalSeconds`. Without UIKit (macOS) one session runs per launch.
+  /// Each session is one `$session` event. Set false to call `startSession` yourself.
+  public var enableAutoSessionTracking: Bool = true
+  /// How long the app may stay in the background before its session ends (default 30 s,
+  /// as Sentry's).
+  public var sessionTrackingIntervalSeconds: Double = 30
+  /// Decides the sampling rate of each new transaction (0–1), or nil to use
+  /// `tracesSampleRate` (and, when that is not set either, the default: automatic
+  /// transactions unsampled, your own kept). Setting it turns automatic tracing on, as a
+  /// rate does. Not asked for a transaction continuing a sampled or unsampled incoming trace.
+  public var tracesSampler: (@Sendable (SamplingContext) -> Double?)? = nil
+  /// The share of sampled transactions to profile, 0–1, or nil (the default: off). A
+  /// background thread samples the main thread's stack every 10 ms while a profiled
+  /// transaction runs (one at a time, at most 30 s), and the profile is sent to
+  /// `/api/v1/profiles` when it finishes, with its id on the transaction as `profile_id`.
+  /// Frames are addresses: upload your dSYMs so the server can name them. See the README,
+  /// "Profiling", for the overhead.
+  public var profilesSampleRate: Double? = nil
+  /// Send each app start as a `$transaction` (`app.start.cold` or `app.start.warm`, with
+  /// `app_start_cold_ms` or `app_start_warm_ms`), from process start to the first frame
+  /// (default false: one event per launch, sampled by `tracesSampleRate`). It also needs
+  /// `tracesSampleRate` or `tracesSampler`: without one nothing is measured. UIKit only.
+  public var enableAppStartTracking: Bool = false
+  /// Time every UIKit view controller's load as a `ui.load` transaction, from `viewDidLoad`
+  /// to the first frame drawn after `viewDidAppear` (`ttid_ms`), by swizzling both (default
+  /// false: one event per screen shown, sampled by `tracesSampleRate`). It also needs
+  /// `tracesSampleRate` or `tracesSampler`: without one nothing is swizzled. Screens are
+  /// named as `captureScreenViews` names them.
+  public var enableUIViewControllerTracing: Bool = false
+  /// Keep an automatic screen load open until `reportFullyDisplayed()` (`ttfd_ms`), or 30 s
+  /// (default false: it finishes at the first frame).
+  public var enableTimeToFullDisplayTracing: Bool = false
+  /// Count slow (missed the display's refresh) and frozen (over 700 ms) frames with a
+  /// `CADisplayLink`, and send them on every transaction as `frames_total`, `frames_slow`
+  /// and `frames_frozen` (default true; UIKit only; adds no events).
+  public var enableFramesTracking: Bool = true
+  /// Detect app hangs: the main thread not answering for `appHangTimeoutInterval` seconds
+  /// while the app is in the foreground (default true, as Sentry's). Starts with
+  /// `installCrashReporting()`; not under a debugger. A hang the app comes out of is sent as an
+  /// error (`App Hang Fully Blocked` / `App Hang Non Fully Blocked`, mechanism `AppHang`) with
+  /// the main thread's stack; one it never comes out of is sent on the next launch as a fatal
+  /// app hang. See the README, "App hangs".
+  public var enableAppHangTracking: Bool = true
+  /// How long the main thread must be blocked to count as a hang, in seconds (default 2, as
+  /// Sentry's; 0 or less means 2).
+  public var appHangTimeoutInterval: Double = 2
+  /// Also report hangs where the main thread still drew a frame now and then but was late for
+  /// the whole timeout (default true, as Sentry's). Needs the display link (UIKit with
+  /// `enableFramesTracking`); without it only fully blocking hangs are found.
+  public var enableReportNonFullyBlockingAppHangs: Bool = true
+  /// On launch, report a previous run the system killed in the foreground without a crash or
+  /// a normal exit (out of memory, the watchdog) as an unhandled `WatchdogTermination`, which
+  /// crashes that run's session (default true, as Sentry's; UIKit only, not on a simulator).
+  /// Starts with `installCrashReporting()`. See the README, "Watchdog terminations".
+  public var enableWatchdogTerminationTracking: Bool = true
+  /// False turns off every method swizzle the SDK would install: URLSession, file I/O,
+  /// Core Data, UIKit screen loads and `ui.click` breadcrumbs (default true, as Sentry's).
+  public var enableSwizzling: Bool = true
+  /// Record every `URLSession` data, upload and download task as an `http.client` span of the
+  /// active transaction, by swizzling `URLSessionTask` (default true, as Sentry's). Needs
+  /// `tracesSampleRate` or `tracesSampler`. `traceparent` goes only to
+  /// `tracePropagationHosts`. Requests to Apphelm itself are never recorded.
+  public var enableNetworkTracking: Bool = true
+  /// An `http` breadcrumb for every `URLSession` request (default true, as Sentry's; with
+  /// `enableAutoBreadcrumbs`). Swizzles `URLSessionTask` even without a trace sample rate.
+  public var enableNetworkBreadcrumbs: Bool = true
+  /// `file.read` / `file.write` spans for `NSData` reads and writes (and `FileManager`'s
+  /// `createFile` on iOS 18 / macOS 15 and later) in the active transaction (default true, as
+  /// Sentry's). Needs `tracesSampleRate` or `tracesSampler`. Swift's `Data(contentsOf:)` and
+  /// `Data.write(to:)` no longer go through `NSData` on recent OS versions: use
+  /// `Data(contentsOfWithApphelmTracing:)` and `writeWithApphelmTracing(to:)` for those.
+  public var enableFileIOTracing: Bool = true
+  /// `db.sql.query` spans for Core Data fetches and `db.sql.transaction` spans for saves in
+  /// the active transaction, by swizzling `NSManagedObjectContext` (default true, as
+  /// Sentry's; only when the app uses Core Data). Needs `tracesSampleRate` or `tracesSampler`.
+  public var enableCoreDataTracing: Bool = true
+  /// Write the SDK's own diagnostics to the unified log (subsystem `dev.apphelm`, category
+  /// `sdk`): why an event was dropped (disabled, `ignoreErrors`, `denyUrls`, `allowUrls`,
+  /// `sampleRate`, `beforeSend`), sends that failed and requests the server refused, with their status. Never event
+  /// contents beyond names, ids and reasons. Default false.
+  public var debug: Bool = false
+  /// False turns the client into a no-op that sends nothing: events, screens, sessions,
+  /// exceptions, messages, crash reports, transactions, profiles, logs, feedback and
+  /// check-ins. Captures return `false` or nil. Flag reads and surveys keep working, and
+  /// `withMonitor` still runs its job. Default true.
+  public var enabled: Bool = true
+  /// The share of errors sent, 0–1 (default 1): exceptions, messages, `captureEvent` and crash
+  /// reports. A sampled-out crash report is deleted. Transactions, sessions, analytics, logs
+  /// and feedback are not affected.
+  public var sampleRate: Double = 1
+  /// Errors (exceptions, messages, `captureEvent`, crash reports) not to send: a pattern
+  /// that matches the message, the error's type or `Type: message`. A plain string matches as
+  /// a substring, `.regex("…")` by search. Matched on the device against the raw text.
+  public var ignoreErrors: [ApphelmPattern] = []
+  /// Errors not to send, by the binary (image) their top stack frame is in, the innermost one
+  /// (`ShopKit`, `MyApp`), with the same patterns: an error whose frame matches any of them is
+  /// dropped. Checked after `ignoreErrors`, before `sampleRate`. Applies to `captureException`
+  /// (whose stack starts where it was called) and to `captureEvent` with a stack trace whose
+  /// first line is in `Thread.callStackSymbols` form. Messages, other events and crash reports
+  /// are always kept. Sentry's Cocoa SDK has no such option.
+  public var denyUrls: [ApphelmPattern] = []
+  /// When not empty, an error whose top frame (as for `denyUrls`) matches none of these
+  /// patterns is dropped too. Errors without such a frame are kept.
+  public var allowUrls: [ApphelmPattern] = []
+  /// Transactions not to send, by name, with the same patterns. A matching transaction is
+  /// not profiled either.
+  public var ignoreTransactions: [ApphelmPattern] = []
+  /// Logs (`client.logger`): lines below this level are not sent. Default `.info`.
+  public var logsMinLevel: LogLevel = .info
+  /// The OpenTelemetry `service.name` of logged lines (default `unknown_service`).
+  public var logsService: String? = nil
+  /// Change or drop (return nil) each log line before it is queued. It sees the line
+  /// already scrubbed.
+  public var beforeSendLog: (@Sendable (LogRecord) -> LogRecord?)? = nil
+  /// Logs are sent every this many seconds (default 2) or when `logsMaxBatch` lines wait
+  /// (default 500). At most `logsMaxQueue` lines wait (default 10,000; the oldest are dropped).
+  public var logsFlushIntervalSeconds: Double = 2
+  public var logsMaxBatch: Int = 500
+  public var logsMaxQueue: Int = 10_000
 
-  public init(apiKey: String, baseURL: String = "https://apphelm.dev", workspaceId: String, productId: String, distinctId: String? = nil, timeoutSeconds: Double = 10, release: String? = nil, environment: String? = nil, tracesSampleRate: Double = 1, tracePropagationHosts: [String] = [], adsConsent: AdsConsent? = nil) {
+  public init(apiKey: String, baseURL: String = "https://apphelm.dev", workspaceId: String, productId: String, distinctId: String? = nil, timeoutSeconds: Double = 10, release: String? = nil, environment: String? = nil, tracesSampleRate: Double? = nil, tracePropagationHosts: [String] = [], adsConsent: AdsConsent? = nil) {
     self.adsConsent = adsConsent
     self.tracePropagationHosts = tracePropagationHosts
     self.apiKey = apiKey
@@ -94,7 +242,7 @@ public struct ApphelmOptions: Sendable {
     self.timeoutSeconds = timeoutSeconds
     self.release = release.map { String($0.prefix(120)) }
     self.environment = environment.map { String($0.prefix(40)) }
-    self.tracesSampleRate = tracesSampleRate.isNaN ? 1 : min(1, max(0, tracesSampleRate))
+    self.tracesSampleRate = tracesSampleRate.map { $0.isNaN ? 1 : min(1, max(0, $0)) }
   }
 }
 
@@ -120,7 +268,7 @@ private struct ConfigsEnvelope: Decodable {
   let data: [FlagConfig]
 }
 
-private struct AcceptedEnvelope: Decodable {
+struct AcceptedEnvelope: Decodable {
   let accepted: Bool?
 }
 
@@ -128,16 +276,16 @@ private struct AcceptedEnvelope: Decodable {
 /// dropped) and flushed on a timer, at a queue length and when the app goes to the
 /// background. UIKit is used only where it exists, for lifecycle events and screen views.
 public final class ApphelmClient: Sendable {
-  private let options: ApphelmOptions
-  private let session: URLSession
+  let options: ApphelmOptions
+  let session: URLSession
   private let store: any DistinctIdStore
   private let installStore: any InstallRecordStore
   private let attributionToken: AttributionTokenProvider
-  private let lock = NSLock()
+  let lock = NSLock()
   private var _distinctId: String
   private let queue: EventQueue
   private let state: ClientState
-  private let appInfo: AppInfo
+  let appInfo: AppInfo
   private var _anonymousId: String
   private var _identified: Bool
   private var _superProperties: [String: Any]
@@ -156,6 +304,8 @@ public final class ApphelmClient: Sendable {
   private var health: (hash: String, clock: TraceClock, directory: URL)?
   // The most recently started transaction, held weakly: an abandoned one is not kept alive.
   private weak var active: Transaction?
+  /// The thread profiles sample: nil is the main thread. Tests name their own.
+  var profiledThread: thread_act_t? = nil
   private var _adsConsent: AdsConsent?
   // Set once this client has queued (or found) the install, so it is queued at most once
   // even when the install record cannot be saved.
@@ -163,14 +313,42 @@ public final class ApphelmClient: Sendable {
   private var replayRecorder: ReplayRecorder?
   // Told of each event tracked while opted in (automatic surveys): its name and screen name.
   private var captureObserver: (@Sendable (String, String?) -> Void)?
+  // Scope: breadcrumbs, tags and the user's hash for exceptions, messages and crashes.
+  private let breadcrumbs: BreadcrumbBuffer
+  private var tags: [String: Any] = [:]
+  private var userHash: String?
+  // setContext: named groups of scalar values, sent as `context.<name>.<key>` tags.
+  var contexts: [String: [String: Any]] = [:]
+  // The id of the last exception, message or event captured (lastEventId).
+  var _lastEventId: String?
+  // Set by close(): nothing is sent afterwards.
+  var closed = false
+  // The logger (`logger`), made on first use.
+  var _logger: ApphelmLogger?
+  // Tests: told each `debug` line.
+  var debugObserver: (@Sendable (String) -> Void)?
+  private var sessionTimeout: SessionTimeout
+  // Set by installCrashReporting: where sessions and the crash scope are written.
+  private var crashDirectory: URL?
+  private var screenLoad: ScreenLoadState?
+  let frames: FrameStats
+  // Where the crash scope is kept (the process-wide store the crash handlers read).
+  private let crashScope: CrashScopeStore
+  private static let appStartLock = NSLock()
+  nonisolated(unsafe) private static var appStartReported = false
 
   /// `installStore` remembers that `$install` was sent (`UserDefaultsInstallRecordStore` by default).
   public convenience init(options: ApphelmOptions, session: URLSession = .shared, store: (any DistinctIdStore)? = nil, installStore: (any InstallRecordStore)? = nil) {
     self.init(options: options, session: session, store: store, installStore: installStore, attributionToken: appleAdsAttributionToken)
   }
 
-  init(options: ApphelmOptions, session: URLSession, store: (any DistinctIdStore)?, installStore: (any InstallRecordStore)?, attributionToken: @escaping AttributionTokenProvider, timerFactory: RepeatingTimerFactory = dispatchTimerFactory, appInfo: AppInfo? = nil) {
+  init(options: ApphelmOptions, session: URLSession, store: (any DistinctIdStore)?, installStore: (any InstallRecordStore)?, attributionToken: @escaping AttributionTokenProvider, timerFactory: RepeatingTimerFactory = dispatchTimerFactory, appInfo: AppInfo? = nil, frames: FrameStats = .shared, crashScope: CrashScopeStore = .shared) {
     self.options = options
+    self.frames = frames
+    self.crashScope = crashScope
+    self.breadcrumbs = BreadcrumbBuffer(capacity: options.maxBreadcrumbs)
+    self.sessionTimeout = SessionTimeout(timeout: options.sessionTrackingIntervalSeconds)
+    _ = sdkLoadedAt
     self.session = session
     let resolvedInstallStore = installStore ?? UserDefaultsInstallRecordStore()
     self.installStore = resolvedInstallStore
@@ -219,8 +397,13 @@ public final class ApphelmClient: Sendable {
       }
     }
     #if canImport(UIKit) && !os(watchOS)
-    if options.captureApplicationLifecycleEvents || options.flushOnBackground { lifecycleObserver = LifecycleObserver(client: self) }
+    if options.captureApplicationLifecycleEvents || options.flushOnBackground || options.enableAutoSessionTracking || options.enableAutoBreadcrumbs { lifecycleObserver = LifecycleObserver(client: self) }
+    UIKitInstrumentation.install(self, options: options)
+    #else
+    // No UIKit lifecycle (macOS): one automatic session per launch.
+    if options.enableAutoSessionTracking { autoSessionForeground() }
     #endif
+    AutoInstrumentation.install(self, options: options)
     if options.captureScreenViews { ScreenCapture.register(self) }
     if let replay = options.replay {
       let uploader = ReplayUploader(baseURL: options.baseURL, key: replay.projectKey ?? options.surveyKey, origin: replay.origin ?? options.surveyOrigin, timeout: options.timeoutSeconds, session: session)
@@ -230,8 +413,11 @@ public final class ApphelmClient: Sendable {
           return ReplayRecorder.Person(distinctId: self.distinctId, identified: self.lock.withLock { self._identified })
         },
         sessionHash: { [weak self] in self?.sessionId },
-        allowed: { [weak self] in self.map { !$0.isOptedOut } ?? false },
+        allowed: { [weak self] in self.map { !$0.isOptedOut && $0.isActive } ?? false },
+        bufferResetSeconds: options.sessionTrackingIntervalSeconds,
         send: uploader.map { uploader -> ReplayRecorder.Sender in { body in await uploader.send(body) } })
+      // A crash's replay waits on disk beside the crash reports once those are installed.
+      replayRecorder?.crashSink = { ReplayCrashStore.shared.update($0) }
     }
     Self.latestLock.withLock { Self._latest = self }
   }
@@ -271,8 +457,32 @@ public final class ApphelmClient: Sendable {
       return wasBackgrounded
     }
     replayRecorder?.visibility(hidden: false)
-    guard let fromBackground, options.captureApplicationLifecycleEvents else { return }
+    guard let fromBackground else { return }
+    if options.enableAutoSessionTracking { autoSessionForeground() }
+    if options.enableAutoBreadcrumbs { addBreadcrumb(category: "app.lifecycle", message: "foreground") }
+    guard options.captureApplicationLifecycleEvents else { return }
     enqueue("$app_opened", properties: ["from_background": fromBackground, "version": appInfo.version, "build": appInfo.build])
+  }
+
+  /// An automatic session for the app coming to the foreground at `now`.
+  func autoSessionForeground(now: Date = Date()) {
+    let action = lock.withLock { sessionTimeout.foreground(at: now.timeIntervalSince1970) }
+    switch action {
+    case .start:
+      startSession()
+    case .restart:
+      endSession()
+      lock.withLock { _ = sessionTimeout.foreground(at: now.timeIntervalSince1970) }
+      startSession()
+    case .keep:
+      // A session ended by hand while in the background: start the next one.
+      if sessionId == nil { startSession() }
+    }
+  }
+
+  /// The app went to the background at `now`: its automatic session ends if it stays there.
+  func autoSessionBackground(now: Date = Date()) {
+    lock.withLock { sessionTimeout.background(at: now.timeIntervalSince1970) }
   }
 
   /// The app went to the background: `$app_backgrounded`, then a flush. `finish` is called
@@ -282,6 +492,8 @@ public final class ApphelmClient: Sendable {
       appActive = false
       wasBackgrounded = true
     }
+    if options.enableAutoSessionTracking { autoSessionBackground() }
+    if options.enableAutoBreadcrumbs { addBreadcrumb(category: "app.lifecycle", message: "background") }
     if options.captureApplicationLifecycleEvents { enqueue("$app_backgrounded", properties: [:]) }
     replayRecorder?.visibility(hidden: true)
     if let replay = replayRecorder { Task { await replay.flush() } }
@@ -296,7 +508,7 @@ public final class ApphelmClient: Sendable {
     lock.withLock { _distinctId }
   }
 
-  private func request(path: String, body: [String: Any]?) throws -> URLRequest {
+  func request(path: String, body: [String: Any]?) throws -> URLRequest {
     guard let url = URL(string: options.baseURL + "/api/v1" + path) else {
       throw ApphelmError(message: "Invalid base URL.", status: 0, code: "invalid_base_url")
     }
@@ -309,8 +521,9 @@ public final class ApphelmClient: Sendable {
     return request
   }
 
-  private func send<T: Decodable>(path: String, body: [String: Any]?) async throws -> T {
-    let request = try request(path: path, body: body)
+  func send<T: Decodable>(path: String, body: [String: Any]?, headers: [String: String] = [:]) async throws -> T {
+    var request = try request(path: path, body: body)
+    for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
     let (data, response) = try await session.data(for: request)
     guard let http = response as? HTTPURLResponse else {
       throw ApphelmError(message: "Non-HTTP response.", status: 0, code: "request_failed")
@@ -341,8 +554,8 @@ public final class ApphelmClient: Sendable {
 
   /// `distinctId` overrides the current id (for `$identify`).
   private func enqueue(_ trimmed: String, properties: [String: Any], distinctId: String? = nil) {
-    let length: Int? = lock.withLock {
-      if _optedOut { return nil }
+    let prepared: [String: Any]? = lock.withLock {
+      if _optedOut || closed || !options.enabled { return nil }
       let signal = customerSignalEvents.contains(trimmed)
       // Super properties and groups first; the event's own properties win.
       var merged: [String: Any] = signal ? [:] : _superProperties
@@ -352,10 +565,13 @@ public final class ApphelmClient: Sendable {
       if let consent = _adsConsent, !signal { merged["$ad_consent"] = consent.rawValue }
       // The person at track time: an event tracked before identify stays the anonymous one's.
       merged["distinct_id"] = distinctId ?? _distinctId
-      // The id and time are fixed at track time, so a resend after a lost response is stored once.
-      return queue.append(["eventName": trimmed, "properties": jsonSafe(merged), "eventId": UUID().uuidString, "occurredAt": ISO8601DateFormatter().string(from: Date())])
+      return jsonSafe(merged) as? [String: Any]
     }
-    guard let length, options.flushAt > 0, length >= options.flushAt else { return }
+    // beforeSend runs outside the lock, so a hook that calls the client can't deadlock.
+    guard let prepared, let kept = keptByBeforeSend(trimmed, prepared), !isOptedOut else { return }
+    // The id and time are fixed at track time, so a resend after a lost response is stored once.
+    let length = queue.append(["eventName": trimmed, "properties": kept, "eventId": UUID().uuidString, "occurredAt": ISO8601DateFormatter().string(from: Date())])
+    guard options.flushAt > 0, length >= options.flushAt else { return }
     let start: Bool = lock.withLock {
       if thresholdFlushRunning || thresholdSuspended { return false }
       thresholdFlushRunning = true
@@ -551,6 +767,7 @@ public final class ApphelmClient: Sendable {
     guard !trimmed.isEmpty else { return }
     var merged = properties
     merged["$screen_name"] = String(trimmed.prefix(300))
+    if options.enableAutoBreadcrumbs { addBreadcrumb(category: "navigation", message: trimmed) }
     track("$screen", properties: merged)
     replayRecorder?.screenChanged(trimmed)
   }
@@ -561,6 +778,8 @@ public final class ApphelmClient: Sendable {
   public func setReplayConsent(_ granted: Bool) {
     guard let recorder = replayRecorder else { return }
     recorder.setConsent(granted)
+    // Withdrawn: a crashed run's replay waiting on disk is not sent either.
+    if !granted { ReplayCrashStore.removeAll(directory: crashFolder) }
     #if canImport(UIKit) && !os(watchOS)
     DispatchQueue.main.async {
       MainActor.assumeIsolated {
@@ -573,7 +792,8 @@ public final class ApphelmClient: Sendable {
   /// True while screens are being recorded: replay configured, consent given, not opted out.
   public var isReplayActive: Bool { replayRecorder?.isActive ?? false }
 
-  /// The current replay recording's id (`rpl_…`), or nil when none is running.
+  /// The current replay recording's id (`rpl_…`), or nil when none is running (and while a
+  /// replay-on-error buffer waits for an error).
   public var replaySessionId: String? { replayRecorder?.sessionId }
 
   /// Send the replay chunks waiting now (they are also sent every few seconds on their own).
@@ -606,7 +826,7 @@ public final class ApphelmClient: Sendable {
     let batch = queue.takePending()
     guard !batch.isEmpty else { return }
     for (index, entry) in batch.enumerated() {
-      if isOptedOut {
+      if isOptedOut || !isActive {
         queue.release(batch.dropFirst(index).map(\.id))
         return
       }
@@ -615,8 +835,10 @@ public final class ApphelmClient: Sendable {
         queue.complete(entry.id)
       } catch let error as ApphelmError where [400, 413, 422].contains(error.status) {
         // Refused for good: resending can't succeed, and it would hold up the queue forever.
+        debugLog("event \(entry.event["eventName"] as? String ?? "?") refused (\(error.status) \(error.code)); dropped")
         queue.complete(entry.id)
       } catch {
+        debugLog("sending queued events failed (\(error)); \(batch.count - index) kept for the next flush")
         queue.release(batch.dropFirst(index).map(\.id))
         lock.withLock { thresholdSuspended = true }
         return
@@ -725,8 +947,9 @@ public final class ApphelmClient: Sendable {
 
   /// Start a release-health session: queues one `$session` event, the signal the browser SDK
   /// sends per page load, carrying the release, environment and a fresh session id, so the
-  /// release's sessions and crash-free rate count this launch. Call it when the app becomes
-  /// active; it is sent with the next `flush()`. Every error reported while it runs carries
+  /// release's sessions and crash-free rate count this launch. With
+  /// `enableAutoSessionTracking` (the default) the client calls it itself; otherwise call it
+  /// when the app becomes active. It is sent with the next `flush()`. Every error reported while it runs carries
   /// the session id, and an unhandled one marks the session crashed on the server. The
   /// session is also noted in `directory` (the crash report folder by default), so a crash
   /// sent on the next launch names the session, release and environment it happened in.
@@ -740,8 +963,8 @@ public final class ApphelmClient: Sendable {
   }
 
   func startSession(directory: URL?, clock: TraceClock) -> String? {
-    guard let release = options.release, !release.isEmpty else { return nil }
-    let folder = directory ?? Self.defaultCrashDirectory()
+    guard options.enabled, let release = options.release, !release.isEmpty else { return nil }
+    let folder = directory ?? lock.withLock { crashDirectory } ?? Self.defaultCrashDirectory()
     let hash = UUID().uuidString.lowercased()
     let running: String? = lock.withLock {
       if let health { return health.hash }
@@ -753,6 +976,7 @@ public final class ApphelmClient: Sendable {
     var properties: [String: Any] = ["session_hash": hash, "release": release]
     if let environment = options.environment { properties["environment"] = environment }
     enqueue("$session", properties: properties)
+    persistScope()
     return hash
   }
 
@@ -768,11 +992,241 @@ public final class ApphelmClient: Sendable {
   public func endSession() -> Bool {
     let ending = lock.withLock { () -> (hash: String, clock: TraceClock, directory: URL)? in
       defer { health = nil }
+      sessionTimeout.ended()
       return health
     }
     guard let ending else { return false }
     SessionLedger.end(hash: ending.hash, at: ending.clock.date(), directory: ending.directory)
+    persistScope()
     return true
+  }
+
+  // MARK: Scope: tags, user, breadcrumbs
+
+  /// A tag sent with every later exception, message and crash (a string, number or boolean;
+  /// nil removes it), like Sentry's `setTag`. At most 20 are kept; keys are letters, digits,
+  /// `_`, `.` and `-`, up to 40 (others are ignored). A tag passed to `captureException`
+  /// or set in `withScope` wins over it.
+  public func setTag(_ key: String, _ value: Any?) {
+    guard let name = tagKey(key) else { return }
+    lock.withLock {
+      if let scalar = tagValue(value) {
+        if tags.count < 20 || tags[name] != nil { tags[name] = scalar }
+      } else {
+        tags.removeValue(forKey: name)
+      }
+    }
+    persistScope()
+  }
+
+  /// `setTag` for each entry (Sentry's `setTags`).
+  public func setTags(_ values: [String: Any?]) {
+    for (key, value) in values.sorted(by: { $0.key < $1.key }) { setTag(key, value) }
+  }
+
+  /// A named group of values sent with every later exception, message and crash (Sentry's
+  /// `setContext`), as tags named `context.<name>.<key>`: tags are what an issue keeps of an
+  /// event. Names and keys are letters, digits, `_` and `-` (name up to 20, key up to 30).
+  /// Only strings, finite numbers and booleans are kept (nested dictionaries and arrays are
+  /// skipped); strings are scrubbed like breadcrumbs and cut to 200 characters, and keys that
+  /// look like secrets or contact details (`password`, `token`, `email`…) are dropped. At most
+  /// 10 contexts of 10 values; an event carries at most 10 context tags, in the room its other
+  /// tags leave of 20, and only those whose whole name fits in 40 characters. nil removes it.
+  /// Inside `withScope`, use `scope.setContext`.
+  public func setContext(_ name: String, _ context: [String: Any]?) {
+    lock.withLock { applyContext(&contexts, name, context) }
+    persistScope()
+  }
+
+  /// Change the scope events are captured with now (Sentry's `configureScope`): inside
+  /// `withScope` that scope, otherwise the client's own (tags, contexts, user, breadcrumbs
+  /// and the transaction automatic spans join).
+  public func configureScope(_ body: (ApphelmScope) -> Void) {
+    if let current = ScopeContext.current {
+      body(current)
+      return
+    }
+    let scratch = ApphelmScope(parent: nil, maxBreadcrumbs: options.maxBreadcrumbs, accept: { [weak self] crumb in self?.acceptBreadcrumb(crumb) })
+    body(scratch)
+    let own = scratch.own
+    for (key, value) in own.tags { setTag(key, value) }
+    if !own.contexts.isEmpty { lock.withLock { for (name, values) in own.contexts { contexts[name] = values } } }
+    if case .some(let hash) = own.user { lock.withLock { userHash = hash } }
+    if let transaction = own.transaction { lock.withLock { active = transaction } }
+    for crumb in scratch.breadcrumbs.all { breadcrumbs.add(crumb) }
+    persistScope()
+  }
+
+  /// The id of the last exception, message or event this client captured (Sentry's
+  /// `lastEventId`), or nil before the first. Set once the error passed `enabled`,
+  /// `ignoreErrors` and `sampleRate`, even when the send then fails. Pass it to
+  /// `captureFeedback(_:associatedEventId:)`.
+  public var lastEventId: String? { lock.withLock { _lastEventId } }
+
+  /// Structured logs to AppHelm (`/api/v1/logs`, batched OpenTelemetry records): the same
+  /// call shape as `os.Logger`, plus attributes, for example
+  /// `apphelm.logger.error("Payment failed", attributes: ["order": id, "error": error])`.
+  /// Lines carry the running transaction's trace id. The key needs `logs:write` (or
+  /// `events:write`).
+  public var logger: ApphelmLogger {
+    lock.withLock {
+      if let existing = _logger { return existing }
+      let made = ApphelmLogger(sink: LogSink(client: self), attributes: [:])
+      _logger = made
+      return made
+    }
+  }
+
+  /// Send everything queued (events, log lines and replay chunks) and wait at most `timeout`
+  /// seconds. True when everything was sent (or failed for good) in time, false on timeout;
+  /// the sends carry on either way. Never throws.
+  @discardableResult
+  public func flush(timeout: TimeInterval) async -> Bool {
+    await waitAtMost(timeout) { [self] in
+      await self.flush()
+      await self.lock.withLock({ self._logger })?.drainAll()
+      await self.replayRecorder?.flush()
+    }
+  }
+
+  /// `flush(timeout:)`, then stop: later events, exceptions, messages, transactions, logs,
+  /// feedback and check-ins are dropped without a request (captures return false or nil) and
+  /// the flush timer stops. Flag reads still work. Calling it again is harmless. Returns what
+  /// the flush returned.
+  @discardableResult
+  public func close(timeout: TimeInterval = 2) async -> Bool {
+    let flushed = await flush(timeout: timeout)
+    let logger: ApphelmLogger? = lock.withLock {
+      closed = true
+      flushTimer?.cancel()
+      flushTimer = nil
+      return _logger
+    }
+    logger?.shutdown()
+    // A run that closed Apphelm is not one the watchdog killed.
+    AppStateStore.shared.update { $0.isSDKRunning = false }
+    return flushed
+  }
+
+  /// The signed-in user, so each issue counts the people it affects. Only a hash is sent
+  /// (`user_hash`): SHA-256 of `apphelm-user:<id>`, the first 32 hex characters, the hash
+  /// the Node, Python and Kotlin clients send. nil (at log-out) clears it. The device's
+  /// `distinctId` is sent with every exception either way.
+  public func setUser(id: String?) {
+    let hash = id.flatMap { $0.isEmpty ? nil : hashUserId($0) }
+    lock.withLock { userHash = hash }
+    persistScope()
+  }
+
+  /// Record a breadcrumb: the last 30 travel with each later exception, message and crash
+  /// report. Inside `withScope` it belongs to that scope only. `beforeBreadcrumb` may change
+  /// or drop it.
+  public func addBreadcrumb(_ crumb: Breadcrumb) {
+    if let scope = ScopeContext.current {
+      scope.addBreadcrumb(crumb)
+      return
+    }
+    guard let kept = acceptBreadcrumb(crumb) else { return }
+    breadcrumbs.add(kept)
+    persistScope()
+  }
+
+  /// `addBreadcrumb(Breadcrumb(category:message:level:data:))`.
+  public func addBreadcrumb(category: String, message: String, level: BreadcrumbLevel = .info, data: [String: String] = [:]) {
+    addBreadcrumb(Breadcrumb(category: category, message: message, level: level, data: data))
+  }
+
+  /// Forget the client's breadcrumbs (not a scope's).
+  public func clearBreadcrumbs() {
+    breadcrumbs.clear()
+    persistScope()
+  }
+
+  /// A breadcrumb after `beforeBreadcrumb`, its category and message made safe to send.
+  func acceptBreadcrumb(_ crumb: Breadcrumb) -> Breadcrumb? {
+    guard options.maxBreadcrumbs > 0 else { return nil }
+    let hooked: Breadcrumb? = options.beforeBreadcrumb.map { $0(crumb) } ?? crumb
+    guard var kept = hooked else { return nil }
+    kept.category = breadcrumbCategory(kept.category)
+    kept.message = breadcrumbMessage(kept.message)
+    return kept
+  }
+
+  /// Run `body` with a scope of its own: tags, a user, breadcrumbs and a transaction for the
+  /// events captured inside it (and in the child tasks it starts), on top of the client's.
+  /// Nested scopes stack, the innermost winning. For example:
+  /// `try await apphelm.withScope { scope in scope.setTag("order", id); try await checkout() }`.
+  public func withScope<T>(_ body: (ApphelmScope) throws -> T) rethrows -> T {
+    let scope = makeScope()
+    return try ScopeContext.$current.withValue(scope) { try body(scope) }
+  }
+
+  /// The same for asynchronous work.
+  public func withScope<T>(_ body: (ApphelmScope) async throws -> T) async rethrows -> T {
+    let scope = makeScope()
+    return try await ScopeContext.$current.withValue(scope) { try await body(scope) }
+  }
+
+  private func makeScope() -> ApphelmScope {
+    ApphelmScope(parent: ScopeContext.current, maxBreadcrumbs: options.maxBreadcrumbs, accept: { [weak self] crumb in self?.acceptBreadcrumb(crumb) })
+  }
+
+  /// The breadcrumbs an event captured now carries: the client's and the current scope's.
+  var currentBreadcrumbs: [Breadcrumb] {
+    breadcrumbs.all + (ScopeContext.current?.allBreadcrumbs ?? [])
+  }
+
+  /// Keep the crash scope on disk up to date, once crash reporting is installed here.
+  func persistScope() {
+    let snapshot: [String: Any]? = lock.withLock {
+      guard crashDirectory != nil else { return nil }
+      var value: [String: Any] = [:]
+      if let release = options.release { value["release"] = release }
+      if let environment = options.environment { value["environment"] = environment }
+      if let health { value["session_hash"] = health.hash }
+      var crashTags = tags
+      addContextTags(&crashTags, contexts)
+      if !crashTags.isEmpty { value["tags"] = crashTags }
+      if let userHash { value["user_hash"] = userHash }
+      return value
+    }
+    guard var snapshot else { return }
+    let crumbs = breadcrumbWire(breadcrumbs.all)
+    if !crumbs.isEmpty { snapshot["breadcrumbs"] = crumbs }
+    crashScope.update(snapshot)
+  }
+
+  /// Tags, user hash, breadcrumbs and trace id for an exception or message captured now.
+  /// Tags are merged most specific first: the call's, then the scope's, then `setTag`'s.
+  func addContext(_ properties: inout [String: Any], callTags: [String: Any], traceId: String?, eventContexts: [String: [String: Any]] = [:]) {
+    let scope = ScopeContext.current
+    var merged: [String: Any] = [:]
+    func add(_ key: String, _ value: Any) {
+      guard merged.count < 20, let name = tagKey(String(key.prefix(40))), merged[name] == nil, let scalar = tagValue(value) else { return }
+      merged[name] = scalar
+    }
+    for (key, value) in callTags.sorted(by: { $0.key < $1.key }) { add(key, value) }
+    for (key, value) in (scope?.allTags ?? [:]).sorted(by: { $0.key < $1.key }) { add(key, value) }
+    let (globalTags, globalUser, globalContexts) = lock.withLock { (tags, userHash, contexts) }
+    for (key, value) in globalTags.sorted(by: { $0.key < $1.key }) { add(key, value) }
+    // setContext groups as `context.<name>.<key>` tags in the room left: the event's own
+    // (captureEvent), then the scope's, then the client's.
+    var allContexts = globalContexts
+    allContexts.merge(scope?.allContexts ?? [:]) { _, own in own }
+    allContexts.merge(eventContexts) { _, own in own }
+    addContextTags(&merged, allContexts)
+    if !merged.isEmpty { properties["tags"] = merged }
+    let user: String?
+    if let scoped = scope?.userHash { user = scoped } else { user = globalUser }
+    if let user { properties["user_hash"] = user }
+    let crumbs = breadcrumbWire(currentBreadcrumbs)
+    if !crumbs.isEmpty { properties["breadcrumbs"] = crumbs }
+    // The trace it happened in: the given id, else the transaction running now.
+    if let traceId, isTraceId(traceId) {
+      properties["trace_id"] = traceId
+    } else if let running = activeTransaction {
+      properties["trace_id"] = running.traceId
+    }
   }
 
   /// Report an error. Swift errors carry no stack of their own, so the stack where
@@ -781,12 +1235,20 @@ public final class ApphelmClient: Sendable {
   /// same fingerprint joins one issue. `tags` are up to 20 scalar values; the server
   /// scrubs them again. `traceId` (`transaction.traceId`) links the issue to the trace it
   /// happened in; anything but a 32-character lower-case hex id is left out.
-  public func captureException(_ error: Error, fingerprint: [String]? = nil, tags: [String: String] = [:], handled: Bool = true, traceId: String? = nil) async throws {
-    var properties: [String: Any] = ["message": String(describing: error).prefix(240).description, "name": String(describing: type(of: error)).prefix(80).description]
+  ///
+  /// It also carries the tags from `setTag` and `withScope`, the user's hash (`setUser`), the
+  /// last 30 breadcrumbs and, when `traceId` is not given, the trace of the transaction
+  /// running now. Returns false when `beforeSend` dropped it or the client is opted out.
+  @discardableResult
+  public func captureException(_ error: Error, fingerprint: [String]? = nil, tags: [String: String] = [:], handled: Bool = true, traceId: String? = nil) async throws -> Bool {
+    let rawMessage = String(describing: error), typeName = String(describing: type(of: error))
+    let frames = Array(Thread.callStackSymbols.drop { $0.contains("$s7Apphelm") })
+    // denyUrls / allowUrls match the binary of the top frame: the code that called this.
+    guard let eventId = admitError(type: typeName, message: rawMessage, frame: frames.first.flatMap(stackFrameImage)) else { return false }
+    var properties: [String: Any] = ["message": scrubbed(rawMessage, limit: 240), "name": typeName.prefix(80).description, "$event_id": eventId]
     if let fingerprint, !fingerprint.isEmpty {
       properties["fingerprint"] = fingerprint.prefix(10).map { String($0.prefix(200)) }
     }
-    let frames = Array(Thread.callStackSymbols.drop { $0.contains("$s7Apphelm") })
     if !frames.isEmpty {
       properties["stack"] = CrashInstaller.boundedStack(Array(frames.prefix(20)))
       // Which binaries those frames are in and where they are loaded, so the server can
@@ -794,10 +1256,26 @@ public final class ApphelmClient: Sendable {
       let images = DebugImages.referenced(by: Array(frames.prefix(20)), among: DebugImages.loaded())
       if !images.isEmpty { properties["debug_images"] = images }
     }
-    if !tags.isEmpty { properties["tags"] = Dictionary(uniqueKeysWithValues: tags.sorted { $0.key < $1.key }.prefix(20).map { (String($0.key.prefix(40)), String($0.value.prefix(200))) }) }
     if !handled { properties["handled"] = false }
-    if let traceId, isTraceId(traceId) { properties["trace_id"] = traceId }
-    try await sendException(properties)
+    addContext(&properties, callTags: tags, traceId: traceId)
+    return try await sendException(properties, eventId: eventId)
+  }
+
+  /// Report a message rather than an error: something noteworthy with no error object, such
+  /// as a fallback taken or a limit reached (Sentry's `captureMessage`). It becomes an issue
+  /// grouped by its text (numbers and ids normalised) or by `fingerprint`, with `level`. No
+  /// stack. It carries the same release, environment, session, tags, user hash, breadcrumbs
+  /// and trace as an exception. Returns false when `beforeSend` dropped it or the client is
+  /// opted out; throws `ApphelmError` when the server refuses it.
+  @discardableResult
+  public func captureMessage(_ message: String, level: MessageLevel = .info, fingerprint: [String]? = nil, tags: [String: String] = [:]) async throws -> Bool {
+    guard let eventId = admitError(type: "", message: message) else { return false }
+    var properties: [String: Any] = ["message": scrubbed(message, limit: 240), "name": "Message", "level": level.rawValue, "$event_id": eventId]
+    if let fingerprint, !fingerprint.isEmpty {
+      properties["fingerprint"] = fingerprint.prefix(10).map { String($0.prefix(200)) }
+    }
+    addContext(&properties, callTags: tags, traceId: nil)
+    return try await sendException(properties, eventId: eventId)
   }
 
   /// A survey request: the browser survey routes, with the project key and its origin.
@@ -904,62 +1382,243 @@ public final class ApphelmClient: Sendable {
   }
 
   /// Start a transaction: a screen load, a sync, a request. Pass an incoming `traceparent`
-  /// to continue a trace started elsewhere; its trace id, parent span and sampling decision
-  /// are kept. Otherwise it is kept with probability `tracesSampleRate`. Send it with
+  /// (or, failing that, a Sentry `sentry-trace` header value) to continue a trace started
+  /// elsewhere; its trace id, parent span and sampling decision are kept. Otherwise it is
+  /// kept with the probability `tracesSampler` returns, else `tracesSampleRate`, else (no rate
+  /// set) always. Send it with
   /// `finish()`. `op` is free text such as `ui.load`, `task` or `http.client` (the server
   /// keeps letters, digits, `_`, `.` and `-`).
   public func startTransaction(_ name: String, op: String = "task", traceparent: String? = nil) -> Transaction {
     startTransaction(name, op: op, traceparent: traceparent, clock: TraceClock())
   }
 
-  func startTransaction(_ name: String, op: String, traceparent: String?, clock: TraceClock) -> Transaction {
-    let parent = parseTraceparent(traceparent)
-    let sampled = parent?.sampled ?? (Double.random(in: 0..<1) < options.tracesSampleRate)
-    let transaction = Transaction(send: { [self] properties in try await sendTransaction(properties) }, name: name, op: op, traceId: parent?.traceId ?? randomHex(16), parentSpanId: parent?.parentSpanId, sampled: sampled, release: options.release, environment: options.environment, clock: clock)
+  /// `automatic`: started by an integration (a screen load, an app start), which is unsampled
+  /// while no rate or sampler is set, unless an incoming trace was sampled.
+  func startTransaction(_ name: String, op: String, traceparent: String?, clock: TraceClock, automatic: Bool = false) -> Transaction {
+    let transaction = makeTransaction(name, op: op, traceparent: traceparent, clock: clock, frames: frames, automatic: automatic)
     lock.withLock { active = transaction }
     return transaction
   }
 
-  /// The transaction automatic spans join: the one started most recently, until it
-  /// finishes. Nil when that one has finished, even if an earlier one is still running, so
-  /// it suits an app with one screen load or sync at a time.
+  /// Whether a trace sample rate or sampler is set: automatic tracing is off until one is.
+  var tracingConfigured: Bool { options.tracesSampleRate != nil || options.tracesSampler != nil }
+
+  private func makeTransaction(_ name: String, op: String, traceparent: String?, clock: TraceClock, frames: FrameStats, automatic: Bool) -> Transaction {
+    let w3c = parseTraceparent(traceparent)
+    let sentry = w3c == nil ? parseSentryTrace(traceparent) : nil
+    let parentSampled: Bool? = w3c?.sampled ?? sentry?.sampled
+    let sampled: Bool
+    if let parentSampled {
+      sampled = parentSampled
+    } else {
+      let asked = options.tracesSampler?(SamplingContext(name: name, op: op, parentSampled: nil))
+      // No rate set: automatic transactions are unsampled (they still carry a trace id for
+      // errors and propagation); your own are kept, as before 0.8.0.
+      let rate = asked.map { $0.isNaN ? 0 : min(1, max(0, $0)) } ?? options.tracesSampleRate ?? (automatic ? 0 : 1)
+      sampled = rate > 0 && Double.random(in: 0..<1) < rate
+    }
+    // ignoreTransactions: kept as a trace (ids, propagation) but never sent or profiled.
+    let ignored = options.ignoreTransactions.contains { $0.matches(name) }
+    let transaction = Transaction(send: { [weak self] properties in
+      guard let self else { return false }
+      if ignored {
+        self.debugLog("transaction dropped (ignoreTransactions)")
+        return false
+      }
+      return try await self.sendTransaction(properties)
+    }, name: name, op: op, traceId: w3c?.traceId ?? sentry?.traceId ?? randomHex(16), parentSpanId: w3c?.parentSpanId ?? sentry?.parentSpanId, sampled: sampled, release: options.release, environment: options.environment, clock: clock, frames: frames)
+    // Profiled only when sampled, by its own rate (off by default), one at a time.
+    let profileRate = options.profilesSampleRate.map { $0.isNaN ? 0 : min(1, max(0, $0)) } ?? 0
+    if sampled, !ignored, isActive, profileRate > 0, Double.random(in: 0..<1) < profileRate, let profiler = ProfileRecorder.start(thread: profiledThread) {
+      transaction.profiler = profiler
+      transaction.sendProfile = { [weak self] profile in await self?.sendProfile(profile) }
+    }
+    return transaction
+  }
+
+  /// The transaction automatic spans and captured exceptions join: the current
+  /// `withScope` scope's `transaction` when it has one, else the one started most recently,
+  /// until it finishes. Nil when that one has finished, even if an earlier one is still
+  /// running, so it suits an app with one screen load or sync at a time.
   public var activeTransaction: Transaction? {
-    lock.withLock { active }.flatMap { $0.isFinished ? nil : $0 }
+    if let scoped = ScopeContext.current?.transaction, !scoped.isFinished { return scoped }
+    return lock.withLock { active }.flatMap { $0.isFinished ? nil : $0 }
   }
 
   /// Record a screen: queues its screen view, as `screen` does, and starts a `ui.load`
   /// transaction named after it, which becomes the `activeTransaction`, so the HTTP calls
   /// the screen makes are its spans. `finish()` it when the screen has its content. Use it
-  /// in place of `screen`, not with it.
+  /// in place of `screen`, not with it. `reportFullyDisplayed()` before `finish()` adds
+  /// `ttfd_ms`.
   public func startScreen(_ name: String, properties: [String: Any] = [:]) -> Transaction {
     screen(name, properties: properties)
-    return startTransaction(name, op: "ui.load")
+    let transaction = startTransaction(name, op: "ui.load")
+    trackScreenLoad(transaction, automatic: false)
+    return transaction
   }
+
+  // MARK: Screen loads (TTID / TTFD)
+
+  private func trackScreenLoad(_ transaction: Transaction, automatic: Bool, waitForFullDisplay: Bool? = nil) {
+    let previous: ScreenLoadState? = lock.withLock {
+      defer { screenLoad = ScreenLoadState(transaction: transaction, automatic: automatic, waitForFullDisplay: waitForFullDisplay) }
+      return screenLoad
+    }
+    transaction.onFinish = { [weak self] finished in
+      self?.lock.withLock { if self?.screenLoad?.transaction === finished { self?.screenLoad = nil } }
+    }
+    // A new screen while the last automatic one still waited for full display: that one ends.
+    if let previous, previous.automatic, let old = previous.transaction, !old.isFinished { Task { await old.finish() } }
+  }
+
+  /// Whether `transaction` is the current automatic screen load and its screen is already
+  /// shown (it only waits for full display).
+  func isShownScreenLoad(_ transaction: Transaction) -> Bool {
+    lock.withLock { screenLoad.map { $0.transaction === transaction && $0.automatic && $0.initialDisplayed } ?? false }
+  }
+
+  /// A screen load the UIKit integration started at `viewDidLoad`.
+  func screenLoadStarted(_ name: String, clock: TraceClock = TraceClock(), waitForFullDisplay: Bool? = nil) -> Transaction {
+    let transaction = startTransaction(name, op: "ui.load", traceparent: nil, clock: clock, automatic: true)
+    trackScreenLoad(transaction, automatic: true, waitForFullDisplay: waitForFullDisplay)
+    return transaction
+  }
+
+  /// The first frame after an automatic screen load's `viewDidAppear`: `ttid_ms`, and the
+  /// transaction finishes unless it waits for `reportFullyDisplayed()`.
+  func screenLoadFirstFrame(_ transaction: Transaction, at nanos: UInt64? = nil) {
+    let end = nanos ?? transaction.clock.nanos()
+    transaction.markInitialDisplay(at: end)
+    let state: ScreenLoadState? = lock.withLock {
+      guard screenLoad?.transaction === transaction else { return nil }
+      screenLoad?.initialDisplayed = true
+      return screenLoad
+    }
+    guard let state, state.automatic else {
+      // Not the current screen any more: nothing waits for it.
+      if !transaction.isFinished && lock.withLock({ screenLoad?.transaction !== transaction }) { Task { await transaction.finish() } }
+      return
+    }
+    if let fullAt = state.fullyDisplayedAt {
+      // Fully displayed before its first frame: full display is the first frame.
+      transaction.markFullDisplay(at: max(fullAt, end))
+      Task { await transaction.finish() }
+    } else if !(state.waitForFullDisplay ?? options.enableTimeToFullDisplayTracing) {
+      Task { await transaction.finish() }
+    } else {
+      DispatchQueue.global().asyncAfter(deadline: .now() + 30) { [weak self, weak transaction] in
+        if let transaction { self?.screenLoadDeadline(transaction) }
+      }
+    }
+  }
+
+  /// 30 s after the first frame without `reportFullyDisplayed()`: the screen load finishes
+  /// without `ttfd_ms`, as Sentry's does.
+  func screenLoadDeadline(_ transaction: Transaction) {
+    guard !transaction.isFinished else { return }
+    Task { await transaction.finish(.ok) }
+  }
+
+  /// Tell Apphelm the current screen has all its content (Sentry's
+  /// `reportFullyDisplayed`): its `ui.load` transaction gets `ttfd_ms` and a
+  /// `ui.load.full_display` span. An automatic screen load waiting for it
+  /// (`enableTimeToFullDisplayTracing`) then finishes; one from `startScreen` still
+  /// finishes when you call `finish()`. Returns false when no screen load is running.
+  @discardableResult
+  public func reportFullyDisplayed() -> Bool {
+    reportFullyDisplayed(clockNanos: nil)
+  }
+
+  func reportFullyDisplayed(clockNanos: UInt64?) -> Bool {
+    let state: ScreenLoadState? = lock.withLock { screenLoad }
+    guard let state, let transaction = state.transaction, !transaction.isFinished else { return false }
+    let now = clockNanos ?? transaction.clock.nanos()
+    if state.automatic && !state.initialDisplayed {
+      lock.withLock { if screenLoad?.transaction === transaction { screenLoad?.fullyDisplayedAt = now } }
+      return true
+    }
+    transaction.markFullDisplay(at: now)
+    if state.automatic { Task { await transaction.finish() } }
+    return true
+  }
+
+  // MARK: App start
+
+  /// Report this launch's app start, once per process, from process start (or, when the
+  /// system prewarmed the process, from when Apphelm was loaded) to `firstFrame`, under
+  /// `AppStartRules`. The launch is remembered in `directory` so the next one can tell cold
+  /// from warm. Returns the transaction, or nil when nothing is reported.
+  @discardableResult
+  func reportAppStart(firstFrame: Date, launchedInBackground: Bool, directory: URL, processStart: Date? = processStartDate(), prewarmed: Bool = isPrewarmedProcess(), boot: Double? = bootTime(), sdkLoaded: Date = sdkLoadedAt, oncePerProcess: Bool = true) async -> Bool {
+    if oncePerProcess {
+      let first: Bool = Self.appStartLock.withLock {
+        defer { Self.appStartReported = true }
+        return !Self.appStartReported
+      }
+      guard first else { return false }
+    }
+    let current = AppStartRecord(bootTime: boot ?? 0, version: appInfo.version, build: appInfo.build)
+    let previous = AppStartLedger.load(directory: directory)
+    AppStartLedger.save(current, directory: directory)
+    guard let processStart, let start = AppStartRules.classify(processStart: processStart, sdkLoaded: sdkLoaded, firstFrame: firstFrame, prewarmed: prewarmed, launchedInBackground: launchedInBackground, previous: previous, current: current) else { return false }
+    let op = "app.start.\(start.type.rawValue)"
+    let transaction = makeTransaction(start.type == .cold ? "App Start Cold" : "App Start Warm", op: op, traceparent: nil, clock: TraceClock(nanos: { 0 }, date: { start.start }), frames: FrameStats(), automatic: true)
+    transaction.setMeasurement("app_start_\(start.type.rawValue)_ms", value: start.durationMs)
+    let nanos = UInt64(start.durationMs) * 1_000_000
+    transaction.add(span: ["span_id": randomHex(8), "parent_span_id": transaction.spanId, "op": op, "description": start.type == .cold ? "Cold Start" : "Warm Start", "start_offset_ms": 0, "duration_ms": start.durationMs, "status": SpanStatus.ok.rawValue])
+    return await transaction.finish(.ok, endNanos: nanos)
+  }
+
+  // MARK: HTTP
 
   /// `session.data(for:)` inside an `http.client` span of `transaction` (by default the
   /// active one). The description is `METHOD scheme://host/path`: the query, fragment and
-  /// any credentials in the URL are left out. A response from 400 up, or a thrown error
-  /// (rethrown), finishes the span as an error. `traceparent` is set, naming the span, only
-  /// when the host is in `tracePropagationHosts`.
+  /// any credentials in the URL are left out. The span's `data` carries
+  /// `http.request.method`, `http.response.status_code`, `server.address` and `url.full`.
+  /// A response from 400 up, or a thrown error (rethrown), finishes the span as an error.
+  /// `traceparent` is set, naming the span, only when the host is in
+  /// `tracePropagationHosts`. Each request also leaves an `http` breadcrumb
+  /// (`GET https://host/path 200`), with or without a transaction.
   ///
   /// Without an unfinished transaction, for a URL that is not http(s), and for the client's
-  /// own requests to Apphelm, it is `session.data(for:)` and nothing more. Don't also give
-  /// that session `httpSpanDelegate()`, or each request is recorded twice.
+  /// own requests to Apphelm, no span is recorded. Don't also give that session
+  /// `httpSpanDelegate()`, or each request is recorded twice.
   public func data(for request: URLRequest, session: URLSession = .shared, transaction: Transaction? = nil) async throws -> (Data, URLResponse) {
-    guard let transaction = transaction ?? activeTransaction, !transaction.isFinished, let target = httpTarget(request.url),
-          target.authority != httpTarget(URL(string: options.baseURL))?.authority else { return try await session.data(for: request) }
-    let span = transaction.startSpan("http.client", description: "\((request.httpMethod ?? "GET").uppercased().prefix(10)) \(target.shown)")
+    guard let target = httpTarget(request.url), target.authority != httpTarget(URL(string: options.baseURL))?.authority else { return try await session.data(for: request) }
+    let method = (request.httpMethod ?? "GET").uppercased()
+    guard let transaction = transaction ?? activeTransaction, !transaction.isFinished else {
+      do {
+        let result = try await NetworkInstrumentation.$recordedByWrapper.withValue(true) { try await session.data(for: request) }
+        httpBreadcrumb(method: method, target: target, statusCode: (result.1 as? HTTPURLResponse)?.statusCode)
+        return result
+      } catch {
+        httpBreadcrumb(method: method, target: target, statusCode: nil)
+        throw error
+      }
+    }
+    let span = transaction.startSpan("http.client", description: "\(method.prefix(10)) \(target.shown)", data: httpSpanData(method: method, target: target, statusCode: nil))
     var request = request
     if propagatesTo(target.host, listed: options.tracePropagationHosts) { span.propagate(&request) }
     do {
-      let result = try await session.data(for: request)
+      let result = try await NetworkInstrumentation.$recordedByWrapper.withValue(true) { try await session.data(for: request) }
       let status = (result.1 as? HTTPURLResponse)?.statusCode
+      if let status { span.setData("http.response.status_code", status) }
       span.finish(status.map { (100...399).contains($0) } ?? false ? .ok : .error)
+      httpBreadcrumb(method: method, target: target, statusCode: status)
       return result
     } catch {
       span.finish(.error)
+      httpBreadcrumb(method: method, target: target, statusCode: nil)
       throw error
     }
+  }
+
+  /// `GET https://host/path 200` (or `failed` without a response), category `http`.
+  func httpBreadcrumb(method: String, target: (host: String, authority: String, shown: String), statusCode: Int?) {
+    guard options.enableAutoBreadcrumbs else { return }
+    var data = ["method": String(method.prefix(10)), "url": target.shown]
+    if let statusCode { data["status_code"] = String(statusCode) }
+    addBreadcrumb(Breadcrumb(category: "http", message: "\(method.prefix(10)) \(target.shown) \(statusCode.map(String.init) ?? "failed")", level: (statusCode.map { $0 < 400 } ?? false) ? .info : .warning, data: data))
   }
 
   /// Set `traceparent` on a request you send yourself (for instance through a session with
@@ -982,64 +1641,120 @@ public final class ApphelmClient: Sendable {
   public func httpSpanDelegate() -> HTTPSpanDelegate { HTTPSpanDelegate(client: self) }
 
   /// Record a finished `URLSession` task as an `http.client` span in `transaction` (by
-  /// default the active one), timed by the task's metrics. The description is
-  /// `METHOD scheme://host/path`: the query, fragment and any credentials in the URL are
-  /// left out. A response from 400 up, or no response, is an error.
+  /// default the active one), timed by the task's metrics, with the same description and
+  /// `data` as `data(for:)`, and an `http` breadcrumb. A response from 400 up, or no
+  /// response, is an error.
   ///
-  /// Nothing is recorded when there is no unfinished transaction, when the request began
-  /// before the transaction, when it is not http(s), or when it is the client's own, to
-  /// Apphelm. It does not set `traceparent`: a delegate cannot change a request. Use
-  /// `data(for:)`, or `propagate(&request)` before sending.
+  /// No span is recorded when there is no unfinished transaction or the request began
+  /// before the transaction; nothing at all when it is not http(s), or when it is the
+  /// client's own, to Apphelm. It does not set `traceparent`: a delegate cannot change a
+  /// request. Use `data(for:)`, or `propagate(&request)` before sending.
   public func recordHTTPSpan(task: URLSessionTask, metrics: URLSessionTaskMetrics, transaction: Transaction? = nil) {
     let request = task.originalRequest
-    recordHTTPSpan(method: request?.httpMethod ?? "GET", url: request?.url, statusCode: (task.response as? HTTPURLResponse)?.statusCode, interval: metrics.taskInterval, transaction: transaction)
+    // What the automatic URLSession instrumentation already records for this client is not
+    // recorded twice.
+    let automatic = NetworkInstrumentation.recorded(task, for: self)
+    recordHTTPSpan(method: request?.httpMethod ?? "GET", url: request?.url, statusCode: (task.response as? HTTPURLResponse)?.statusCode, interval: metrics.taskInterval, transaction: transaction, breadcrumb: !automatic.breadcrumb, span: !automatic.span)
   }
 
-  func recordHTTPSpan(method: String, url: URL?, statusCode: Int?, interval: DateInterval, transaction: Transaction? = nil) {
-    guard let transaction = transaction ?? activeTransaction, let target = httpTarget(url),
-          target.authority != httpTarget(URL(string: options.baseURL))?.authority else { return }
-    transaction.addHTTPSpan(method: method, shown: target.shown, interval: interval, ok: statusCode.map { (100...399).contains($0) } ?? false)
+  func recordHTTPSpan(method: String, url: URL?, statusCode: Int?, interval: DateInterval, transaction: Transaction? = nil, breadcrumb: Bool = true, span: Bool = true) {
+    guard let target = httpTarget(url), target.authority != httpTarget(URL(string: options.baseURL))?.authority else { return }
+    if breadcrumb { httpBreadcrumb(method: method.uppercased(), target: target, statusCode: statusCode) }
+    guard span, let transaction = transaction ?? activeTransaction else { return }
+    transaction.addHTTPSpan(method: method, target: target, statusCode: statusCode, interval: interval, ok: statusCode.map { (100...399).contains($0) } ?? false)
   }
 
-  /// Transactions carry no person and no stack, as in the other clients.
-  private func sendTransaction(_ properties: [String: Any]) async throws {
-    guard !isOptedOut else { return }
+  // MARK: Sending
+
+  /// `beforeSend` for event `name`: the properties to send, or nil when the hook dropped the
+  /// event or returned something that can't be sent as JSON.
+  func keptByBeforeSend(_ name: String, _ properties: [String: Any]) -> [String: Any]? {
+    guard let hook = options.beforeSend else { return properties }
+    var offered = properties
+    offered[Self.eventNameKey] = name
+    guard var kept = hook(offered) else { return nil }
+    kept.removeValue(forKey: Self.eventNameKey)
+    guard JSONSerialization.isValidJSONObject(kept) else { return nil }
+    return kept
+  }
+
+  /// The event's name, in the dictionary `beforeSend` is given; never sent.
+  static let eventNameKey = "$event_name"
+
+  /// Transactions carry no person and no stack, as in the other clients. False when opted
+  /// out or dropped by `beforeSend`.
+  /// Post one profile (Profiling.swift). A failed send is dropped: profiling never breaks the app.
+  func sendProfile(_ profile: [String: Any]) async {
+    guard !isOptedOut, isActive else { return }
+    let _: AcceptedEnvelope? = try? await send(path: "/profiles", body: ["workspaceId": options.workspaceId, "productId": options.productId, "profile": profile])
+  }
+
+  private func sendTransaction(_ properties: [String: Any]) async throws -> Bool {
+    guard !isOptedOut, isActive else { return false }
+    guard let kept = keptByBeforeSend("$transaction", properties) else {
+      debugLog("transaction dropped by beforeSend")
+      return false
+    }
     let envelope: AcceptedEnvelope = try await send(path: "/events", body: [
       "workspaceId": options.workspaceId,
       "productId": options.productId,
       "eventName": "$transaction",
       "privacyMode": "strict",
-      "properties": withAdConsent(properties),
+      "properties": withAdConsent(kept),
     ])
     _ = envelope
+    return true
   }
 
-  /// `crashedIn` is the earlier session a stored crash report belongs to: the report then
-  /// carries that session's id, release and environment, not this launch's.
-  private func sendException(_ properties: [String: Any], crashedIn: StoredSession? = nil) async throws {
+  /// `origin` describes the earlier run a stored crash report belongs to: the report then
+  /// carries that run's session id, release and environment, not this launch's. False when
+  /// opted out or dropped by `beforeSend`.
+  ///
+  /// Once `beforeSend` keeps it, the event is linked to session replay (`replay_session_id`):
+  /// the running recording, or a replay-on-error buffer, which an exception (not a message)
+  /// uploads. A crash report links the crashed run's replay through `crashReplay`.
+  func sendException(_ properties: [String: Any], origin: CrashOrigin? = nil, eventId: String? = nil, crashReplay: (() async -> String?)? = nil) async throws -> Bool {
     var merged = properties
-    let running = crashedIn == nil ? sessionId : nil
-    if let crashedIn {
-      merged["session_hash"] = crashedIn.hash
-      merged["release"] = crashedIn.release
-      if let environment = crashedIn.environment { merged["environment"] = environment }
+    if let origin {
+      if let hash = origin.sessionHash { merged["session_hash"] = hash }
+      if let release = origin.release ?? options.release { merged["release"] = release }
+      if let environment = origin.release == nil ? options.environment : origin.environment { merged["environment"] = environment }
     } else {
-      if let release = options.release { merged["release"] = release }
-      if let environment = options.environment { merged["environment"] = environment }
+      // captureEvent may name its own release and environment.
+      if merged["release"] == nil, let release = options.release { merged["release"] = release }
+      if merged["environment"] == nil, let environment = options.environment { merged["environment"] = environment }
       // The session it happened in: an unhandled one marks that session crashed.
-      if let running { merged["session_hash"] = running }
+      if let running = sessionId { merged["session_hash"] = running }
     }
     // The person, as on every other event, so the issue counts the users it affects.
     merged["distinct_id"] = distinctId
-    guard !isOptedOut else { return }
-    let envelope: AcceptedEnvelope = try await send(path: "/events", body: [
+    guard !isOptedOut, isActive else { return false }
+    guard var kept = keptByBeforeSend("$exception", jsonSafe(merged) as? [String: Any] ?? merged) else {
+      debugLog("error \(eventId ?? "") dropped by beforeSend")
+      return false
+    }
+    if origin != nil {
+      if let crashReplay, let replayId = await crashReplay() { kept["replay_session_id"] = replayId }
+    } else if let recorder = replayRecorder, let replayId = recorder.errorCaptured(isException: (kept["name"] as? String) != "Message") {
+      kept["replay_session_id"] = replayId
+      Task { await recorder.flush() }
+    }
+    var body: [String: Any] = [
       "workspaceId": options.workspaceId,
       "productId": options.productId,
       "eventName": "$exception",
       "privacyMode": "strict",
-      "properties": withAdConsent(merged),
-    ])
-    _ = envelope
+      "properties": withAdConsent(kept),
+    ]
+    if let eventId { body["eventId"] = eventId }
+    do {
+      let envelope: AcceptedEnvelope = try await send(path: "/events", body: body)
+      _ = envelope
+    } catch {
+      debugLog("sending error \(eventId ?? "") failed: \(error)")
+      throw error
+    }
+    return true
   }
 
   /// Where crash reports wait for the next launch: `Caches/Apphelm` unless you pass one.
@@ -1047,19 +1762,51 @@ public final class ApphelmClient: Sendable {
     FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Apphelm", isDirectory: true)
   }
 
-  /// Record crashes (uncaught `NSException`s and fatal signals, including Swift traps) to
-  /// disk as they happen. Call once, early in launch, then `sendPendingCrashReports()`.
-  /// Installing again in the same process does nothing. Other crash reporters installed
-  /// earlier still receive the crash: Apphelm calls their handlers after writing its report.
+  /// Record crashes (uncaught `NSException`s and fatal signals, including Swift traps with the
+  /// runtime's `Fatal error: …` message, and stack overflows on the installing thread and on
+  /// every thread started after it) to disk as they happen, with this client's scope: release,
+  /// environment, session, tags, user hash and breadcrumbs. It also starts app-hang detection
+  /// (`enableAppHangTracking`) and, on UIKit, watchdog-termination tracking
+  /// (`enableWatchdogTerminationTracking`). Call once, early in launch, then
+  /// `sendPendingCrashReports()`. Installing again in the same process does nothing. Other
+  /// crash reporters installed earlier still receive the crash: Apphelm calls their handlers
+  /// after writing its report. Automatic sessions and the app-start record are kept in the
+  /// same directory.
   public func installCrashReporting(directory: URL? = nil) throws {
-    try CrashInstaller.install(directory: directory ?? Self.defaultCrashDirectory())
+    guard options.enabled else { return }
+    let folder = directory ?? Self.defaultCrashDirectory()
+    try CrashInstaller.install(directory: folder)
+    useCrashDirectory(folder)
+    trackWatchdogTerminations(directory: folder)
+    startAppHangTracking(directory: folder)
   }
 
-  /// Send crashes recorded by earlier runs as unhandled exceptions, then delete them. A
-  /// report that fails to send stays for the next launch. Returns how many were sent.
+  /// Keep sessions and the crash scope in `folder` from now on; a session already running
+  /// is noted there too.
+  func useCrashDirectory(_ folder: URL) {
+    let moved: (hash: String, clock: TraceClock)? = lock.withLock {
+      crashDirectory = folder
+      guard let running = health, running.directory != folder else { return nil }
+      health = (running.hash, running.clock, folder)
+      return (running.hash, running.clock)
+    }
+    if let moved, let release = options.release {
+      SessionLedger.record(StoredSession(hash: moved.hash, release: release, environment: options.environment, startedAt: moved.clock.date().timeIntervalSince1970, endedAt: nil), directory: folder)
+    }
+    persistScope()
+  }
+
+  /// The directory `installCrashReporting` was given, else the default one.
+  var crashFolder: URL { lock.withLock { crashDirectory } ?? Self.defaultCrashDirectory() }
+
+  /// Send crashes recorded by earlier runs as unhandled exceptions, then delete them. Each
+  /// carries the crashed run's release, environment, session, tags, user hash and last
+  /// breadcrumbs. A report that fails to send stays for the next launch; one `beforeSend`
+  /// drops is deleted. Returns how many were sent.
   @discardableResult
   public func sendPendingCrashReports(directory: URL? = nil) async -> Int {
-    let folder = directory ?? Self.defaultCrashDirectory()
+    guard options.enabled, !lock.withLock({ closed }) else { return 0 }
+    let folder = directory ?? crashFolder
     var sent = 0
     for report in CrashInstaller.pendingReports(directory: folder) {
       // Opted out: the crash is not sent later either.
@@ -1072,20 +1819,87 @@ public final class ApphelmClient: Sendable {
         continue
       }
       let mechanism = properties.removeValue(forKey: "mechanism") as? String ?? "crash"
-      properties["handled"] = false
-      properties["tags"] = ["mechanism": mechanism]
-      // The session that was running when the report was written, unless it is this launch's.
-      let crashedIn = SessionLedger.session(forReport: report, directory: folder).flatMap { $0.hash == sessionId ? nil : $0 }
-      do {
-        try await sendException(properties, crashedIn: crashedIn)
+      // Crashes and watchdog terminations are unhandled; a hang the app came out of is not.
+      let handled = properties.removeValue(forKey: "handled") as? Bool ?? false
+      // ignoreErrors and sampleRate: a crash report they drop is deleted. Not denyUrls or
+      // allowUrls: a crash's innermost frame is usually the system's (CoreFoundation for an
+      // NSException, libsystem_kernel for abort), so a crash report passes no frame.
+      if let reason = errorDropReason(type: properties["name"] as? String ?? "", message: properties["message"] as? String ?? "") {
+        debugLog("crash report dropped (\(reason))")
         CrashInstaller.remove(report: report)
-        sent += 1
+        continue
+      }
+      let crashEventId = newEventId()
+      properties["$event_id"] = crashEventId
+      if !handled { properties["handled"] = false }
+      var tags: [String: Any] = ["mechanism": mechanism]
+      let origin: CrashOrigin
+      if let scope = CrashInstaller.scope(report: report) {
+        // The run's own scope, written while it ran (0.8.0 and later).
+        for (key, value) in ((scope["tags"] as? [String: Any]) ?? [:]).sorted(by: { $0.key < $1.key }) where tags.count < 20 && tags[key] == nil {
+          if let name = tagKey(key), let scalar = tagValue(value) { tags[name] = scalar }
+        }
+        if let user = scope["user_hash"] as? String { properties["user_hash"] = user }
+        // Scrubbed again: a report written by an earlier SDK kept them as recorded.
+        if let crumbs = scope["breadcrumbs"] as? [[String: String]], !crumbs.isEmpty {
+          properties["breadcrumbs"] = crumbs.suffix(30).map { crumb in crumb.merging(crumb["message"].map { ["message": scrubbed($0, limit: 200, scrubFrame)] } ?? [:]) { _, new in new } }
+        }
+        // A fatal app hang carries `session_status: abnormal` (CrashReporting.swift): it ends this
+        // session abnormal, a crash or watchdog termination ends it crashed, as in Sentry.
+        let hash = (scope["session_hash"] as? String).flatMap { $0 == sessionId ? nil : $0 }
+        origin = CrashOrigin(sessionHash: hash, release: scope["release"] as? String, environment: scope["environment"] as? String)
+      } else {
+        // The session that was running when the report was written, unless it is this launch's.
+        origin = SessionLedger.session(forReport: report, directory: folder).flatMap { $0.hash == sessionId ? nil : CrashOrigin(sessionHash: $0.hash, release: $0.release, environment: $0.environment) }
+          // None: this launch's release, and no session (never this launch's own).
+          ?? CrashOrigin()
+      }
+      properties["tags"] = tags
+      do {
+        // The crashed run's replay, sent first and linked when it arrived.
+        let replayFile = ReplayCrashStore.file(for: report)
+        let recorder = replayRecorder
+        let crashReplay: (() async -> String?)? = recorder.flatMap { recorder in
+          replayFile.flatMap { file in (try? Data(contentsOf: file)).map { data in { await recorder.sendCrashReplay(data) } } }
+        }
+        if try await sendException(properties, origin: origin, eventId: crashEventId, crashReplay: crashReplay) { sent += 1 }
+        // Sent, or dropped by beforeSend: either way it is done with.
+        CrashInstaller.remove(report: report)
       } catch {
         break
       }
     }
     return sent
   }
+}
+
+/// The run a stored crash report came from.
+struct CrashOrigin {
+  var sessionHash: String? = nil
+  var release: String? = nil
+  var environment: String? = nil
+}
+
+/// The screen load `reportFullyDisplayed` applies to.
+struct ScreenLoadState {
+  weak var transaction: Transaction?
+  var automatic: Bool
+  var initialDisplayed = false
+  var fullyDisplayedAt: UInt64?
+  /// Wait for `reportFullyDisplayed()` (a SwiftUI view's `waitForFullDisplay`), or nil for
+  /// `enableTimeToFullDisplayTracing`.
+  var waitForFullDisplay: Bool?
+
+  init(transaction: Transaction, automatic: Bool, waitForFullDisplay: Bool? = nil) {
+    self.transaction = transaction
+    self.automatic = automatic
+    self.waitForFullDisplay = waitForFullDisplay
+  }
+}
+
+/// A `captureMessage` level, sent as `level`.
+public enum MessageLevel: String, Sendable {
+  case fatal, error, warning, info, debug
 }
 
 private struct ErrorEnvelope: Decodable {

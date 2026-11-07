@@ -13,6 +13,12 @@ extension ApphelmOptions {
     options.flushAt = 0
     options.captureApplicationLifecycleEvents = false
     options.captureScreenViews = false
+    options.enableAutoSessionTracking = false
+    // The process-wide swizzles would record other tests' requests and file writes.
+    options.enableNetworkTracking = false
+    options.enableNetworkBreadcrumbs = false
+    options.enableFileIOTracing = false
+    options.enableCoreDataTracing = false
     return options
   }
 }
@@ -607,8 +613,9 @@ struct UIKitScreenTests {
     appear(child)
     appear(parent)
     await apphelm.flush()
-    // Another suite's ScreenCapture.capture("Settings") may reach this client too.
-    #expect(server.properties("$screen").compactMap { $0["$screen_name"] as? String }.filter { $0 != "Settings" } == ["Checkout", "Pay"])
+    // Other suites' screens (ScreenCapture.capture("Settings"), the screen-load suite's Orders
+    // controller) may reach this client too: suites run in parallel.
+    #expect(server.properties("$screen").compactMap { $0["$screen_name"] as? String }.filter { $0 != "Settings" && $0 != "Orders" } == ["Checkout", "Pay"])
   }
 }
 #endif

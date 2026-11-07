@@ -2,8 +2,8 @@
 # Turn a dSYM into the symbol table Apphelm symbolicates iOS and macOS crashes with, and
 # optionally upload it.
 #
-# Apphelm's server can't read DWARF, so the dSYM stays on this machine. This script reads
-# it with Xcode's own tools and writes, for each architecture in it, a small text file:
+# For builds whose dSYM must stay on this machine (`apphelm debug-files upload` sends it, with
+# lines and inlined frames). This reads it with Xcode's tools and writes, per architecture:
 # the binary's UUID, then one line per function with its offset from the start of the
 # image, its size, its name and (with --lines) the file and line it is declared at.
 #

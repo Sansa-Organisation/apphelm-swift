@@ -33,10 +33,22 @@ private func screen(fieldText: String = "hunter2", secure: Bool = true) -> Repla
   return root
 }
 
-private func recorder(_ outbox: Outbox, clock: TestClock = TestClock(), options: ReplayOptions = ReplayOptions(), identified: Bool = true, allowed: @escaping @Sendable () -> Bool = { true }) -> ReplayRecorder {
+private func recorder(_ outbox: Outbox, clock: TestClock = TestClock(), options: ReplayOptions = ReplayOptions(), identified: Bool = true, allowed: @escaping @Sendable () -> Bool = { true }, random: @escaping @Sendable () -> Double = { 0.5 }) -> ReplayRecorder {
   ReplayRecorder(options: options, workspaceId: "org_1", productId: "prd_1", now: { clock.now() },
-    person: { .init(distinctId: "user-1", identified: identified) }, sessionHash: { "sess-1234-abcd" }, allowed: allowed,
+    person: { .init(distinctId: "user-1", identified: identified) }, sessionHash: { "sess-1234-abcd" }, allowed: allowed, random: random,
     send: { outbox.send($0) })
+}
+
+/// A screen whose label says `text`, so each one is a new wireframe.
+private func screen(label text: String) -> ReplayViewNode {
+  var root = screen()
+  root.children[0].text = text
+  return root
+}
+
+/// Options for replay on error only: no whole recordings, every error uploads.
+private func bufferOnly(_ rate: Double = 1, seconds: Double = 30) -> ReplayOptions {
+  ReplayOptions(sessionSampleRate: 0, onErrorSampleRate: rate, errorBufferSeconds: seconds)
 }
 
 @Suite("Wireframe replay")
@@ -290,4 +302,179 @@ struct ReplayTests {
     await refused.flushReplay()
     #expect(seen.lock.withLock { seen.requests.count } == 1)
   }
+}
+
+@Suite("Replay sampling and replay on error")
+struct ReplayBufferTests {
+  @Test("sessionSampleRate leaves a recording out: nothing is captured, built or sent")
+  func sampledOut() async {
+    let outbox = Outbox()
+    let replay = recorder(outbox, options: ReplayOptions(sessionSampleRate: 0.2), random: { 0.5 })
+    replay.setConsent(true)
+    #expect(!replay.capture(screen(), width: 390, height: 844))
+    replay.tap(x: 1, y: 1)
+    await replay.flush()
+    #expect(outbox.sent.isEmpty && replay.sessionId == nil && replay.eventCount == 0)
+    #expect(replay.errorCaptured(isException: true) == nil)
+    // Kept when the draw is under the rate.
+    let kept = recorder(outbox, options: ReplayOptions(sessionSampleRate: 0.2), random: { 0.1 })
+    kept.setConsent(true)
+    #expect(kept.capture(screen(), width: 390, height: 844) && kept.sessionId != nil && !kept.isBuffering)
+  }
+
+  @Test("A buffer records into memory only: nothing is sent and it is no replay yet")
+  func buffersInMemory() async {
+    let outbox = Outbox()
+    let replay = recorder(outbox, options: bufferOnly())
+    replay.setConsent(true)
+    #expect(replay.capture(screen(), width: 390, height: 844))
+    replay.tap(x: 4, y: 4)
+    await replay.flush()
+    #expect(outbox.sent.isEmpty && replay.isBuffering && replay.sessionId == nil && replay.eventCount == 4)
+    #expect(!replay.shouldFlush)
+  }
+
+  @Test("An exception uploads the last 30 seconds, starting with the screen shown then, and recording carries on")
+  func errorUploadsBuffer() async throws {
+    let outbox = Outbox()
+    let clock = TestClock()
+    let replay = recorder(outbox, clock: clock, options: bufferOnly())
+    replay.screenChanged("Home")
+    replay.setConsent(true)
+    for second in 0..<10 {
+      replay.capture(screen(label: "Screen \(second)"), width: 390, height: 844)
+      clock.advance(5)
+    }
+    // 50 s recorded, the last screen at 45 s: what is older than 15 s is gone, and the screen
+    // shown then (from 10 s) is carried to the start.
+    let id = try #require(replay.errorCaptured(isException: true))
+    #expect(!replay.isBuffering && replay.sessionId == id)
+    await replay.flush()
+    let body = try #require(outbox.sent.first)
+    #expect(body["sessionId"] as? String == id && body["sequence"] as? Int == 0 && body["ended"] as? Bool == false && body["entryPath"] as? String == "/Home")
+    let events = try #require(body["events"] as? [[String: Any]])
+    #expect(events.prefix(3).map { $0["type"] as? String } == ["viewport", "navigation", "wireframe"])
+    #expect(events.prefix(3).allSatisfy { $0["t"] as? Int == 0 })
+    let times = events.compactMap { $0["t"] as? Int }
+    #expect(times == times.sorted() && times.last! <= 30_000)
+    let labels = events.compactMap { ($0["nodes"] as? [[String: Any]])?.first { $0["i"] as? Int == 2 }?["t"] as? String }
+    #expect(labels == ["Screen 2", "Screen 3", "Screen 4", "Screen 5", "Screen 6", "Screen 7", "Screen 8", "Screen 9"])
+    // The replay starts where the kept stretch does: 15 s in.
+    #expect(body["startedAt"] as? String == "2027-01-15T08:00:15Z")
+    // Recording continues as a whole recording, with the next sequence.
+    replay.tap(x: 9, y: 9)
+    await replay.flush()
+    #expect(outbox.sent.count == 2 && outbox.sent[1]["sequence"] as? Int == 1 && outbox.sent[1]["sessionId"] as? String == id)
+    let tap = try #require((outbox.sent[1]["events"] as? [[String: Any]])?.first)
+    #expect(tap["t"] as? Int == 35_000)
+    // A later error, or a message, links the same replay.
+    #expect(replay.errorCaptured(isException: false) == id)
+  }
+
+  @Test("A message does not upload a buffer, and onErrorSampleRate draws per error")
+  func messagesAndRate() {
+    let draws = Draws([0.9, 0.9, 0.2])
+    let replay = recorder(Outbox(), options: bufferOnly(0.5), random: { draws.next() })
+    replay.setConsent(true)
+    // The first draw is the session rate (0, so a buffer).
+    replay.capture(screen(), width: 390, height: 844)
+    #expect(replay.isBuffering)
+    #expect(replay.errorCaptured(isException: false) == nil)
+    #expect(replay.errorCaptured(isException: true) == nil && replay.isBuffering)
+    #expect(replay.errorCaptured(isException: true) != nil && !replay.isBuffering)
+  }
+
+  @Test("A buffer holds at most about 2 MB, dropping the oldest wireframes first")
+  func bufferBytes() {
+    let clock = TestClock()
+    let replay = recorder(Outbox(), clock: clock, options: bufferOnly())
+    replay.setConsent(true)
+    var root = ReplayViewNode(id: 1, x: 0, y: 0, width: 390, height: 844)
+    for round in 0..<40 {
+      root.children = (0..<2_900).map { ReplayViewNode(id: $0 + 2, kind: .text, x: 0, y: 0, width: 10, height: 10, text: "row \($0) of \(round)") }
+      replay.capture(root, width: 390, height: 844)
+      clock.advance(0.1)
+    }
+    #expect(replay.bufferedBytes <= ReplayRecorder.maxBufferBytes && replay.eventCount < 40)
+  }
+
+  @Test("A buffer is cleared after the session timeout in the background; a short visit keeps it")
+  func backgroundClears() {
+    let clock = TestClock()
+    let replay = recorder(Outbox(), clock: clock, options: bufferOnly())
+    replay.setConsent(true)
+    replay.capture(screen(), width: 390, height: 844)
+    replay.visibility(hidden: true)
+    clock.advance(10)
+    replay.visibility(hidden: false)
+    #expect(replay.isBuffering && replay.eventCount == 5)
+    replay.visibility(hidden: true)
+    clock.advance(31)
+    replay.visibility(hidden: false)
+    #expect(!replay.isBuffering && replay.eventCount == 0)
+    // The next screen starts a new buffer, not a whole recording.
+    replay.capture(screen(), width: 390, height: 844)
+    #expect(replay.isBuffering)
+  }
+
+  @Test("A buffer no error asked for is never sent, not even when the recording ends")
+  func endedBufferDropped() async {
+    let outbox = Outbox()
+    let replay = recorder(outbox, options: bufferOnly())
+    replay.setConsent(true)
+    replay.capture(screen(), width: 390, height: 844)
+    replay.personChanged()
+    await replay.flush()
+    #expect(outbox.sent.isEmpty && replay.pendingCount == 0)
+  }
+
+  @Test("A crash snapshot carries the buffer; the next launch uploads it at the crashed run's rate")
+  func crashSnapshot() async throws {
+    let outbox = Outbox()
+    let replay = recorder(outbox, options: bufferOnly(0.5))
+    #expect(replay.crashSnapshot() == nil)
+    replay.setConsent(true)
+    replay.capture(screen(), width: 390, height: 844)
+    let data = try #require(replay.crashSnapshot())
+    let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    #expect(object["buffering"] as? Bool == true && object["onErrorSampleRate"] as? Double == 0.5 && !String(decoding: data, as: UTF8.self).contains("hunter2"))
+    // The next launch: drawn above the rate, not sent.
+    let skipped = recorder(outbox, random: { 0.7 })
+    #expect(await skipped.sendCrashReplay(data) == nil && outbox.sent.isEmpty)
+    let next = recorder(outbox, random: { 0.3 })
+    let id = await next.sendCrashReplay(data)
+    #expect(id == object["sessionId"] as? String && outbox.sent.count == 1 && outbox.sent[0]["ended"] as? Bool == true && outbox.sent[0]["sequence"] as? Int == 0)
+    // Opted out on the next launch: nothing.
+    let optedOut = recorder(outbox, allowed: { false }, random: { 0 })
+    #expect(await optedOut.sendCrashReplay(data) == nil && outbox.sent.count == 1)
+  }
+
+  @Test("A whole recording's crash snapshot is its unsent tail, ended, with the next sequence")
+  func sessionSnapshot() async throws {
+    let outbox = Outbox()
+    let replay = recorder(outbox)
+    replay.setConsent(true)
+    replay.capture(screen(), width: 390, height: 844)
+    await replay.flush()
+    replay.tap(x: 2, y: 2)
+    let data = try #require(replay.crashSnapshot())
+    let next = recorder(outbox, random: { 0.99 })
+    #expect(await next.sendCrashReplay(data) == replay.sessionId)
+    #expect(outbox.sent.count == 2 && outbox.sent[1]["sequence"] as? Int == 1 && outbox.sent[1]["ended"] as? Bool == true)
+    // Everything sent: the snapshot still links the crash to the recording, and sends nothing.
+    await replay.flush()
+    let sentAlready = try #require(replay.crashSnapshot())
+    #expect(await next.sendCrashReplay(sentAlready) == replay.sessionId && outbox.sent.count == 3)
+    // Withdrawn consent leaves no snapshot.
+    replay.setConsent(false)
+    #expect(replay.crashSnapshot() == nil)
+  }
+}
+
+/// Random draws in order, then 0.5.
+private final class Draws: @unchecked Sendable {
+  private let lock = NSLock()
+  private var values: [Double]
+  init(_ values: [Double]) { self.values = values }
+  func next() -> Double { lock.withLock { values.isEmpty ? 0.5 : values.removeFirst() } }
 }

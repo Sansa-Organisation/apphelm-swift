@@ -214,18 +214,23 @@ struct TracingTests {
     #expect(recorder.bodies.count == 1)
   }
 
-  @Test("captureException(traceId:) links the issue to its trace; a malformed id is left out")
+  @Test("captureException(traceId:) links the issue to its trace; without a valid one it joins the running transaction")
   func exceptionLink() async throws {
     struct CartFailed: Error {}
     let recorder = Recorder()
     let client = ApphelmClient(options: options(recorder), session: recorder.session(), store: MemoryStore())
+    let other = "4bf92f3577b34da6a3ce929d0e0e4736"
     let tx = client.startTransaction("CheckoutScreen")
-    try await client.captureException(CartFailed(), traceId: tx.traceId)
+    try await client.captureException(CartFailed(), traceId: other)
     try await client.captureException(CartFailed(), traceId: "not-a-trace")
     try await client.captureException(CartFailed())
+    await tx.finish()
+    try await client.captureException(CartFailed())
     #expect(recorder.bodies[0]["eventName"] as? String == "$exception")
-    #expect(recorder.properties(0)["trace_id"] as? String == tx.traceId)
-    #expect(recorder.properties(1)["trace_id"] == nil)
-    #expect(recorder.properties(2)["trace_id"] == nil)
+    #expect(recorder.properties(0)["trace_id"] as? String == other)
+    #expect(recorder.properties(1)["trace_id"] as? String == tx.traceId)
+    #expect(recorder.properties(2)["trace_id"] as? String == tx.traceId)
+    // properties(3) is the transaction; after it finished, nothing is running.
+    #expect(recorder.properties(4)["trace_id"] == nil)
   }
 }

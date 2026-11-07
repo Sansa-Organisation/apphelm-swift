@@ -127,6 +127,19 @@ extension ClientTests {
     #expect(CrashInstaller.pendingReports(directory: crashFolder).isEmpty)
   }
 
+  @Test("denyUrls and allowUrls never drop a crash report")
+  func crashReportsSkipUrlFilters() async throws {
+    try CrashInstaller.install(directory: crashFolder)
+    clearCrashFolder()
+    writeExceptionReport(NSException(name: .invalidArgumentException, reason: "bad", userInfo: nil))
+    var options = releaseOptions()
+    options.denyUrls = [.regex(".")]
+    options.allowUrls = ["NoSuchImage"]
+    let session = stubbedSession { request in try jsonResponse(url: request.url!, status: 202, body: ["accepted": true, "eventId": "evt_1"]) }
+    #expect(await ApphelmClient(options: options, session: session, store: MemoryStore()).sendPendingCrashReports(directory: crashFolder) == 1)
+    #expect(CrashInstaller.pendingReports(directory: crashFolder).isEmpty)
+  }
+
   @Test("captureException names the images its frames are in, with their UUIDs and load addresses")
   func captureExceptionImages() async throws {
     struct CheckoutFailed: Error {}
