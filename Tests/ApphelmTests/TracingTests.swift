@@ -162,6 +162,26 @@ struct TracingTests {
     #expect(recorder.properties(0)["op"] as? String == "task")
   }
 
+  @Test("Span descriptions share 8,000 characters past the first 200 per transaction, each up to 2,000")
+  func descriptionAllowance() async throws {
+    let recorder = Recorder()
+    let client = ApphelmClient(options: options(recorder), session: recorder.session(), store: MemoryStore())
+    let tx = client.startTransaction("Sync")
+    let long = String(repeating: "select name from t ", count: 120)
+    tx.startSpan("db.query", description: "SELECT 1").finish()
+    for _ in 0..<48 { tx.startSpan("db.query", description: long).finish() }
+    tx.startSpan("db.query", description: "SELECT 2").finish()
+    await tx.finish()
+    let text = try #require(recorder.properties(0)["spans"] as? String)
+    let spans = try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]])
+    let lengths = spans.map { ($0["description"] as? String)?.count ?? -1 }
+    #expect(lengths.count == 50)
+    #expect(lengths[0] == 8 && lengths[49] == 8)
+    #expect(lengths[1] == 2_000 && lengths[4] == 2_000 && lengths[5] == 1_000 && lengths[6] == 200 && lengths[48] == 200)
+    #expect(lengths.reduce(0) { $0 + max(0, $1 - 200) } == 8_000)
+    #expect(fitDescription(long, kept: []) == String(long.prefix(2_000)))
+  }
+
   @Test("An incoming traceparent is continued with its trace id, parent and sampling decision")
   func continuation() async throws {
     let recorder = Recorder()

@@ -169,15 +169,28 @@ struct ParityTests {
     #expect(sandbox.files.isEmpty)
   }
 
-  @Test("An event the server refuses for good is dropped instead of holding up the queue")
-  func refusedEventDropped() async throws {
+  @Test("An event the server refuses for good (a 4xx but 408 and 429) is dropped instead of holding up the queue",
+        arguments: [400, 401, 403, 404, 413, 422])
+  func refusedEventDropped(status: Int) async throws {
     let server = ScriptedServer()
-    server.answer { $0 == "bad" ? 422 : 202 }
+    server.answer { $0 == "bad" ? status : 202 }
     let apphelm = client(options(server, nil), server)
     apphelm.track("bad"); apphelm.track("good")
     await apphelm.flush()
     await apphelm.flush()
     #expect(server.names == ["bad", "good"])
+  }
+
+  @Test("A timeout or rate limit (408, 429) keeps the event for the next flush", arguments: [408, 429])
+  func retriedEventKept(status: Int) async throws {
+    let server = ScriptedServer()
+    server.answer { _ in status }
+    let apphelm = client(options(server, nil), server)
+    apphelm.track("kept")
+    await apphelm.flush()
+    server.answer { _ in 202 }
+    await apphelm.flush()
+    #expect(server.names == ["kept", "kept"])
   }
 
   @Test("A property JSON can't hold is sent as text instead of failing every flush")

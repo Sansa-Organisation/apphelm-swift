@@ -110,6 +110,16 @@ func spanData(_ data: [String: Any]) -> [String: Any] {
   return kept
 }
 
+/// A span description cut to fit its transaction, as the browser and Node SDKs do: each span
+/// keeps up to 2,000 characters, but those past the first 200 share 8,000 per transaction, so
+/// one with many long statements stays inside AppHelm's request limit. `kept` are the
+/// transaction's spans already kept, in order.
+func fitDescription(_ text: String, kept: [[String: Any]]) -> String {
+  var room = 8_000
+  for span in kept { if let description = span["description"] as? String { room -= max(0, description.count - 200) } }
+  return String(text.prefix(min(2_000, 200 + max(0, room))))
+}
+
 /// The span `data` keys of an HTTP request (Sentry and OpenTelemetry names): method, status
 /// code, host and `scheme://host[:port]/path`.
 func httpSpanData(method: String, target: (host: String, authority: String, shown: String), statusCode: Int?) -> [String: Any] {
@@ -257,7 +267,12 @@ public final class Transaction: @unchecked Sendable {
   }
 
   func add(span: [String: Any]) {
-    lock.withLock { if !finished && spans.count < 50 { spans.append(span) } }
+    lock.withLock {
+      guard !finished && spans.count < 50 else { return }
+      var span = span
+      if let text = span["description"] as? String { span["description"] = fitDescription(text, kept: spans) }
+      spans.append(span)
+    }
   }
 
   /// An `http.client` span for a request that has already finished, timed by the wall clock

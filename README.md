@@ -22,7 +22,7 @@ swift test
 Install with Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/Sansa-Organisation/apphelm-swift.git", from: "0.8.0")
+.package(url: "https://github.com/Sansa-Organisation/apphelm-swift.git", from: "0.8.1")
 // target dependency: .product(name: "Apphelm", package: "apphelm-swift")
 ```
 
@@ -57,7 +57,8 @@ left out of backups. Events survive the app being killed and are sent on a later
 holds `maxQueueSize` events (default 1000), the oldest dropped first. A send that fails
 (offline, a 5xx) leaves that event and the ones after it queued, in order, with the same
 event id and time, so nothing is lost or sent twice. An event the server refuses for good
-(400, 413, 422) is dropped rather than holding up the queue. `.directory(url, suiteName:)`
+(any 4xx but 408 and 429: invalid, too large, a wrong or revoked key, a missing scope) is
+dropped rather than holding up the queue. `.directory(url, suiteName:)`
 puts the queue and the state somewhere else (an app group); `.memory` writes nothing.
 
 Each event's `distinct_id`, super properties and groups are fixed when it is tracked, not
@@ -215,8 +216,9 @@ try await apphelm.withScope { scope in
   `installCrashReporting()` gets one at once; every thread started after it (`Thread`,
   `pthread_create`, Dispatch's worker threads) gets one as it starts, through libpthread's
   public introspection hook (`pthread_introspection_hook_install`), freed as it ends; a hook
-  installed before Apphelm's is still called. The 128 KB each is `mmap`ed, so only the pages
-  a crash handler touches use memory. Threads that were already running at install (other
+  installed before Apphelm's is still called. Each started thread's 128 KB is `mmap`ed, so only
+  the pages a crash handler touches use memory; the installing thread's is 64 KB (or
+  `SIGSTKSZ` if larger), and is left alone when that thread already has one. Threads that were already running at install (other
   than the installing one) have none, so an overflow on them is not recorded: install early.
   This replaces Sentry's Mach exception handler for this case; see "What is different from
   Sentry's crash reporter" below.

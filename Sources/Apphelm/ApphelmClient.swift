@@ -7,6 +7,13 @@ public struct ApphelmError: Error, Sendable {
   public let code: String
 }
 
+extension ApphelmError {
+  /// The server will refuse the same request again however often it is sent: any 4xx but 408
+  /// (timeout) and 429 (rate limited), such as invalid, too large, a wrong or revoked key or a
+  /// missing scope. A queued event refused this way is dropped, as the server SDKs do.
+  var refusedForGood: Bool { (400..<500).contains(status) && status != 408 && status != 429 }
+}
+
 /// Synchronous distinct-id storage. back it with UserDefaults, Keychain, or memory in tests.
 public protocol DistinctIdStore: Sendable {
   func load() -> String?
@@ -833,7 +840,7 @@ public final class ApphelmClient: Sendable {
       do {
         try await sendQueued(entry.event)
         queue.complete(entry.id)
-      } catch let error as ApphelmError where [400, 413, 422].contains(error.status) {
+      } catch let error as ApphelmError where error.refusedForGood {
         // Refused for good: resending can't succeed, and it would hold up the queue forever.
         debugLog("event \(entry.event["eventName"] as? String ?? "?") refused (\(error.status) \(error.code)); dropped")
         queue.complete(entry.id)
